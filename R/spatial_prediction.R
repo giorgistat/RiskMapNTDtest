@@ -1612,11 +1612,11 @@ update_predictors <- function(object, predictors) {
 ##' This function evaluates the predictive performance of spatial models fitted to `RiskMapNTDtest` objects using cross-validation. It supports two classes of diagnostic tools:
 ##'
 ##' - **Scoring rules**, including the Continuous Ranked Probability Score (CRPS) and its scaled version (SCRPS), which quantify the sharpness and calibration of probabilistic forecasts;
-##' - **Calibration diagnostics**, based on the Probability Integral Transform (PIT) for Gaussian outcomes and Aggregated nonparametric PIT (AnPIT) curves for discrete outcomes (e.g., Poisson or Binomial).
+##' - **Calibration diagnostics**, based on the Probability Integral Transform (PIT) for Gaussian outcomes and Aggregated nonparametric PIT (AnPIT) curves for discrete outcomes (e.g., Poisson, Binomial, or the DSGM intensity likelihood).
 ##'
 ##' Cross-validation can be performed using either spatial clustering or regularized subsampling with a minimum inter-point distance. For each fold or subset, models can be refitted or evaluated with fixed parameters, offering flexibility in model validation. The function also provides visualizations of the spatial distribution of test folds.
 ##'
-##' @param object A list of `RiskMapNTDtest` objects, each representing a model fitted with `glgpm`.
+##' @param object A list of `RiskMapNTDtest` objects, each representing a model fitted with `glgpm`, `dast`, or `dsgm`.
 ##' @param keep_par_fixed Logical; if `TRUE`, parameters are kept fixed across folds, otherwise the model is re-estimated for each fold.
 ##' @param iter Integer; number of times to repeat the cross-validation.
 ##' @param fold Integer; number of folds for cross-validation (required if `method = "cluster"`).
@@ -1642,6 +1642,31 @@ update_predictors <- function(object, predictors) {
 ##'   regularized distance splitting defined by \code{method}.
 ##' @param ... Additional arguments passed to clustering or subsampling functions.
 ##'
+##' @details
+##' For DSGM fits (\code{family \%in\% c("intprev", "lf_mdiag")}), the predictive
+##' distribution differs by sub-model:
+##' \itemize{
+##'   \item \strong{STH (\code{family = "intprev"})}: a hurdle process — a
+##'     Bernoulli gate for egg-positivity followed by a shifted Gamma or
+##'     zero-truncated NegBin intensity conditional on positivity. In addition
+##'     to CRPS/SCRPS/AnPIT on the marginal (egg-count) predictive, the
+##'     function decomposes calibration into (1) the positivity gate
+##'     (\code{pos_cal}: observed vs. predicted fraction positive per fold,
+##'     with per-point location IDs for reliability plots) and (2) AnPIT
+##'     conditional on \eqn{Y>0} (\code{AnPIT_cond}), using only the positive
+##'     part of the predictive distribution.
+##'   \item \strong{LF (\code{family = "lf_mdiag"})}: a single Binomial
+##'     likelihood per observation, with success probability depending on
+##'     whether the record is parasitological (MF) or serological (antigen),
+##'     the latter scaled by the fixed sensitivity \code{gamma_sens}. No
+##'     hurdle decomposition applies; CRPS/SCRPS/AnPIT are computed directly
+##'     on this Binomial predictive, exactly as for a \code{glgpm(family =
+##'     "binomial")} fit.
+##' }
+##' Hurdle-decomposition diagnostics (\code{pos_cal}, \code{AnPIT_cond}) are
+##' therefore only populated for STH fits; LF fits only populate the standard
+##' \code{score} and \code{AnPIT} elements.
+##'
 ##' @return A list of class `RiskMapNTDtest.spatial.cv`, containing:
 ##' \describe{
 ##'   \item{test_set}{A list of test sets used for validation, each of class `'sf'`.}
@@ -1650,6 +1675,8 @@ update_predictors <- function(object, predictors) {
 ##'       \item{score}{A list with CRPS and/or SCRPS scores for each fold if requested.}
 ##'       \item{PIT}{(if `family = "gaussian"` and `which_metric` includes `"AnPIT"`) A list of PIT values for test data.}
 ##'       \item{AnPIT}{(if `family` is discrete and `which_metric` includes `"AnPIT"`) A list of AnPIT curves for test data.}
+##'       \item{pos_cal}{(STH/\code{intprev} DSGM fits only) Per-fold positivity gate calibration.}
+##'       \item{AnPIT_cond}{(STH/\code{intprev} DSGM fits only, if `which_metric` includes `"AnPIT"`) AnPIT conditional on \eqn{Y>0}.}
 ##'     }
 ##'   }
 ##' }
@@ -1876,12 +1903,18 @@ assess_pp <- function(object,
                         poisson  = exp)
     dast_flag <- is_dast_fit(fit0)
     dsgm_flag <- is_dsgm_fit(fit0)
+    ## DSGM sub-model flags: STH (hurdle, intensity likelihood) vs
+    ## LF (single Binomial likelihood, diagnostic-dependent success prob)
+    sth_flag  <- dsgm_flag && identical(fit0$family, "intprev")
+    lf_flag   <- dsgm_flag && identical(fit0$family, "lf_mdiag")
 
     if (messages) {
       message(sprintf("\nModel '%s' (%s)", model_names[h], if (dast_flag) {
         "DAST"
-      } else if(dsgm_flag) {
-        "DSGM"
+      } else if (sth_flag) {
+        "DSGM (STH)"
+      } else if (lf_flag) {
+        "DSGM (LF)"
       } else {
         "GLGM"
       }
@@ -1895,8 +1928,9 @@ assess_pp <- function(object,
       if (fam == "gaussian") PIT <- vector("list", n_iter) else AnPIT <- vector("list", n_iter)
     }
 
-    ## containers for hurdle-decomposed diagnostics
-    if (dsgm_flag) {
+    ## containers for hurdle-decomposed diagnostics (STH DSGM fits only —
+    ## the LF DSGM model has no positivity gate to decompose)
+    if (sth_flag) {
       pos_cal <- vector("list", n_iter)
       if (get_AnPIT) AnPIT_cond <- vector("list", n_iter)
     }
@@ -1955,7 +1989,7 @@ assess_pp <- function(object,
             )
           ))
         } else if (dsgm_flag) {
-          ## DSGM refit
+          ## DSGM refit (covers both STH 'intprev' and LF 'lf_mdiag')
           time_sym <- fit0$call$time
           refit_i <- eval(bquote(
             dsgm(
@@ -1970,7 +2004,7 @@ assess_pp <- function(object,
               penalty       = .(fit0$penalty),
               drop_W        = .(fit0$fix_alpha_W),
               decay_W       = .(fit0$fix_gamma_W),
-              vary_k        = fit_dsgm$vary_k,
+              vary_k        = .(isTRUE(fit0$vary_k)),
               power_val     = .(fit0$power_val),
               crs           = .(fit0$crs),
               scale_to_km   = .(fit0$scale_to_km),
@@ -2004,11 +2038,11 @@ assess_pp <- function(object,
           refit_i$int_mat           <- refit_i$int_mat[keep, , drop = FALSE]
         }
         if(dsgm_flag) {
-          if(refit_i$family=="intprev") {
+          if(sth_flag) {
             refit_i$prevalence_data <- refit_i$prevalence_data[keep]
             refit_i$egg_counts <- refit_i$egg_counts[keep]
             refit_i$intensity_data <- refit_i$egg_counts[refit_i$egg_counts>0]
-          } else if(refit_i$family=="lf_mdiag") {
+          } else if(lf_flag) {
             refit_i$y_counts <- refit_i$y_counts[keep]
             refit_i$which_diag <- refit_i$which_diag[keep]
           }
@@ -2062,44 +2096,53 @@ assess_pp <- function(object,
         mu_samp  <- t((1/(1+exp(-eta_samp))))*mda_eff_cov
         eta_samp <- t(eta_samp)
 
-      } else if(dsgm_flag) {
-        ## Build the DSGM prediction inputs
+      } else if (dsgm_flag) {
+        ## Build the DSGM prediction inputs (STH and LF diverge below)
         time_col  <- deparse(fit0$call$time)
-        grid_pred_list <- list(
-          geometry            = sf::st_as_sfc(data_test_i),
-          survey_times_data   = data_test_i[[time_col]],
-          int_mat             = fit0$int_mat[out_id, , drop = FALSE],
-          mda_times           = fit0$mda_times
-        )
+        use_mda_i <- isTRUE(refit_i$use_mda)
 
-        mda_eff_cov <- compute_mda_effect(data_test_i[[time_col]],
-                                          mda_times = refit_i$mda_times,
-                                          intervention = grid_pred_list$int_mat,
-                                          alpha = coef.RiskMapNTDtest(refit_i)$alpha_W,
-                                          gamma = coef.RiskMapNTDtest(refit_i)$gamma_W,
-                                          kappa = 1)
-
-        mu_W <- exp(pred_S$S_samples+pred_S$mu_pred)*mda_eff_cov
-        rho_i <- coef(refit_i)$rho; k_i <- coef(refit_i)$k
-        omega1_i <- coef(refit_i)$omega1
-
-        if(refit_i$vary_k) {
-          agg_W <- k_i*mu_W^omega1_i
+        mda_eff_cov <- if (use_mda_i) {
+          compute_mda_effect(data_test_i[[time_col]],
+                             mda_times    = refit_i$mda_times,
+                             intervention = fit0$int_mat[out_id, , drop = FALSE],
+                             alpha        = coef.RiskMapNTDtest(refit_i)$alpha_W,
+                             gamma        = coef.RiskMapNTDtest(refit_i)$gamma_W,
+                             kappa        = 1)
         } else {
-          agg_W <- k_i
+          rep(1, nrow(data_test_i))
         }
 
-        prev_samples <- 1-(agg_W/(agg_W+mu_W*(1-exp(-rho_i))))^agg_W
+        mu_W  <- exp(pred_S$S_samples + pred_S$mu_pred) * mda_eff_cov
+        rho_i <- coef(refit_i)$rho
+        k_i   <- coef(refit_i)$k
 
-        mu_C     = (rho_i * mu_W) / prev_samples
-        sigma2_C =
-          (rho_i * mu_W * (1 + rho_i)) / prev_samples +
-          (rho_i^2 * mu_W^2 / prev_samples) * (1/agg_W + 1 - 1/prev_samples)
+        if (sth_flag) {
+          ## STH: hurdle process -- Bernoulli gate + intensity | positive
+          omega1_i <- coef(refit_i)$omega1
+          agg_W <- if (isTRUE(refit_i$vary_k)) k_i * mu_W^omega1_i else k_i
 
-        if(refit_i$intensity_family=="negbin") {
-          mu_C1    = mu_C - 1
-          denom_nb = sigma2_C - mu_C1
-          phi_C    = mu_C1^2 / denom_nb
+          prev_samples <- 1 - (agg_W / (agg_W + mu_W * (1 - exp(-rho_i))))^agg_W
+
+          mu_C     <- (rho_i * mu_W) / prev_samples
+          sigma2_C <- (rho_i * mu_W * (1 + rho_i)) / prev_samples +
+            (rho_i^2 * mu_W^2 / prev_samples) * (1 / agg_W + 1 - 1 / prev_samples)
+
+          if (refit_i$intensity_family == "negbin") {
+            mu_C1    <- mu_C - 1
+            denom_nb <- sigma2_C - mu_C1
+            phi_C    <- mu_C1^2 / denom_nb
+          }
+
+        } else if (lf_flag) {
+          ## LF: single Binomial success probability, diagnostic-dependent
+          agg_W   <- k_i
+          gs      <- refit_i$gamma_sens
+          is_mf_i <- fit0$which_diag[out_id]     # 1 = parasitological (MF), 0 = serological
+
+          p_mf <- 1 - (agg_W / (agg_W + mu_W * (1 - exp(-rho_i))))^agg_W
+          p_ag <- gs * (1 - (agg_W / (agg_W + mu_W))^agg_W)
+
+          mu_samp <- p_mf * is_mf_i + p_ag * (1 - is_mf_i)
         }
 
       } else {
@@ -2116,12 +2159,15 @@ assess_pp <- function(object,
         mu_samp <- linkfun(eta_samp)
       }
 
-      if(!dsgm_flag) {
-        n_pred <- nrow(eta_samp)
-        n_draw <- ncol(eta_samp)
-      } else {
+      if (sth_flag) {
         n_pred <- nrow(mu_C1)
         n_draw <- ncol(mu_C1)
+      } else if (lf_flag) {
+        n_pred <- nrow(mu_samp)
+        n_draw <- ncol(mu_samp)
+      } else {
+        n_pred <- nrow(eta_samp)
+        n_draw <- ncol(eta_samp)
       }
 
       if (get_CRPS)   CRPS [[i]] <- numeric(n_pred)
@@ -2142,15 +2188,18 @@ assess_pp <- function(object,
         }
       }
 
-      if(dsgm_flag) {
+      if (sth_flag) {
         y_i <- fit0$egg_counts[out_id]
+      } else if (lf_flag) {
+        y_i       <- fit0$y_counts[out_id]
+        units_m_i <- fit0$units_m[out_id]
       } else {
         units_m_i <- fit0$units_m[out_id]
         y_i       <- fit0$y[out_id]
       }
 
-      ## per-iteration accumulators for hurdle diagnostics
-      if (dsgm_flag) {
+      ## per-iteration accumulators for hurdle diagnostics (STH only)
+      if (sth_flag) {
         obs_pos_i  <- integer(n_pred)   # observed 1(Y > 0)
         pred_pos_i <- numeric(n_pred)   # predicted P(Y > 0)
         if (get_AnPIT)
@@ -2168,14 +2217,17 @@ assess_pp <- function(object,
           }
           if (get_AnPIT) PIT_i[j] <- stats::pnorm(y_i[j], mean = mu_j, sd = sd_j)
         } else {
-          if (fam == "binomial") {
+          if (fam == "binomial" || lf_flag) {
+            ## Standard Binomial predictive; also covers the DSGM LF model,
+            ## whose success probability (mu_samp) already accounts for the
+            ## MF vs. antigen diagnostic and test sensitivity.
             y_samp  <- stats::rbinom(n_draw, size = units_m_i[j], prob = mu_samp[j, ])
             support <- 0:units_m_i[j]
           } else if(fam == "poisson") { # Poisson
             lambda  <- units_m_i[j] * mu_samp[j, ]
             y_samp  <- stats::rpois(n_draw, lambda)
             support <- 0:max(max(y_samp), y_i[j], stats::qpois(0.999, mean(lambda)))
-          } else if(fam == "intprev") {
+          } else if (sth_flag) {
             if(refit_i$intensity_family=="negbin") {
               ## proper Bernoulli gate + aligned shifted-NB draws
               y_samp <- integer(n_draw)
@@ -2216,8 +2268,8 @@ assess_pp <- function(object,
           }
         }
 
-        ## hurdle decomposition diagnostics
-        if (dsgm_flag) {
+        ## hurdle decomposition diagnostics (STH only)
+        if (sth_flag) {
           ## (1) gate: observed vs predicted positivity
           obs_pos_i[j]  <- as.integer(y_i[j] > 0)
           pred_pos_i[j] <- mean(prev_samples[j, ])
@@ -2238,8 +2290,8 @@ assess_pp <- function(object,
         if (fam == "gaussian") PIT[[i]] <- PIT_i else AnPIT[[i]] <- rowMeans(AnPIT_i)
       }
 
-      ## aggregate hurdle diagnostics for this fold
-      if (dsgm_flag) {
+      ## aggregate hurdle diagnostics for this fold (STH only)
+      if (sth_flag) {
         pos_cal[[i]] <- list(
           obs_frac  = mean(obs_pos_i),                 # observed fraction Y > 0
           pred_frac = mean(pred_pos_i),                # model-expected fraction Y > 0
@@ -2264,8 +2316,8 @@ assess_pp <- function(object,
       if (fam == "gaussian") out$model[[model_names[h]]]$PIT <- PIT else out$model[[model_names[h]]]$AnPIT <- AnPIT
     }
 
-    ## write hurdle decomposition diagnostics to output
-    if (dsgm_flag) {
+    ## write hurdle decomposition diagnostics to output (STH only)
+    if (sth_flag) {
       out$model[[model_names[h]]]$pos_cal <- pos_cal
       if (get_AnPIT) out$model[[model_names[h]]]$AnPIT_cond <- AnPIT_cond
     }
@@ -2275,7 +2327,6 @@ assess_pp <- function(object,
   class(out) <- "RiskMapNTDtest.spatial.cv"
   return(out)
 }
-
 
 ##' Simulate surface data based on a spatial model
 ##'
