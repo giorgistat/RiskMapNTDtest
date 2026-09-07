@@ -1,0 +1,80 @@
+
+<!-- README.md is generated from README.Rmd. Please edit that file -->
+
+# RiskMapNTDtest
+
+<!-- badges: start -->
+
+[![CRAN
+version](https://www.r-pkg.org/badges/version/RiskMapNTDtest)](https://cran.r-project.org/package=RiskMapNTDtest)
+[![R-CMD-check](https://github.com/claudiofronterre/RiskMapNTDtest/actions/workflows/R-CMD-check.yaml/badge.svg)](https://github.com/claudiofronterre/RiskMapNTDtest/actions/workflows/R-CMD-check.yaml)
+[![CRAN
+downloads](https://cranlogs.r-pkg.org/badges/RiskMapNTDtest)](https://cran.r-project.org/package=RiskMapNTDtest)
+[![Total
+downloads](https://cranlogs.r-pkg.org/badges/grand-total/RiskMapNTDtest)](https://cran.r-project.org/package=RiskMapNTDtest)
+[![lifecycle](https://img.shields.io/badge/lifecycle-maturing-blue.svg)](https://lifecycle.r-lib.org/articles/stages.html)
+<!-- badges: end -->
+
+## Overview
+
+`RiskMapNTDtest` provides tools for model-based geostatistical analysis of
+continuous, binomial and Poisson outcomes.
+
+- Fit spatial and spatio-temporal Gaussian process models.
+- Generate predictive surfaces and target summaries.
+- Run simulation-based diagnostics and validation workflows.
+
+The methodology is described in *Model-based Geostatistics for Global
+Public Health* by Diggle and Giorgi.
+
+## Start Here: MBG-R Book
+
+For a full applied guide to using `RiskMapNTDtest` in real public health
+workflows, see the online book by **Emanuele Giorgi and Claudio
+Fronterre**:
+
+**Model-based geostatistics for global public health using R**
+<https://www.mbgr.org/>
+
+## Installation
+
+Install the stable version from CRAN:
+
+``` r
+install.packages("RiskMapNTDtest")
+```
+
+Install the development version from GitHub:
+
+``` r
+# install.packages("devtools")
+devtools::install_github("claudiofronterre/RiskMapNTDtest")
+```
+
+## Quickstart
+
+A minimal linear Gaussian geostatistical model of the form
+$Y(x) = \beta_0 + S(x)$, where $S(x)$ is a spatial Gaussian process can
+be fitted with:
+
+``` r
+library(RiskMapNTDtest)
+
+data(italy_sim)
+
+fit <- glgpm(
+  formula = y ~ gp(x1, x2),
+  data = italy_sim,
+  family = "gaussian",
+  crs = 32634,
+  messages = FALSE
+)
+
+summary(fit)
+```
+
+## Learn More
+
+- MBG-R book: <https://www.mbgr.org/>
+- Package website: <https://claudiofronterre.github.io/RiskMapNTDtest/>
+- Issue tracker: <https://github.com/claudiofronterre/RiskMapNTDtest/issues>

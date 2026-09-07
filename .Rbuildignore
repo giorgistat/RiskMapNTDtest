@@ -1,0 +1,9 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^README\.Rmd$
+^LICENSE\.md$
+^data-raw$
+^src/.*\.o$
+^src/.*\.so$
+^src/.*\.dll$
+^\.github$
