@@ -436,11 +436,16 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
 }
 
 
-# =============================================================================
-# Internal: TMB-MCML engine for the LF multi-diagnostic model
-# (unchanged — vary_k not applicable to the LF model)
-# =============================================================================
-
+##' @title Fit LF multi-diagnostic model via TMB-MCML
+##' @description Internal engine for fitting \code{dsgm(model = "lf_mdiag")}
+##'   via Monte Carlo Maximum Likelihood using TMB. Supports both a
+##'   Negative Binomial and an exact Poisson (omega -> infinity limit)
+##'   latent worm burden.
+##' @param worm_family Integer; 0 = Negative Binomial, 1 = Poisson. Under
+##'   Poisson, \code{log_omega} is mapped out of the TMB optimisation via
+##'   \code{map=} (fixed at its initial value, never differentiated), since
+##'   the likelihood in \code{dsgm_mdiag.cpp} does not read \code{omega} in
+##'   that branch. \code{k} is reported as \code{Inf} in the returned params.
 ##' @keywords internal
 .dsgm_fit_tmb_lf_mdiag <- function(y_counts, units_m, which_diag, D, coords,
                                    ID_coords, cov_offset, gamma_sens,
@@ -451,6 +456,14 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
                                    par0, S_samples_obj, messages) {
 
   .load_dsgm_mdiag(messages = messages)
+
+  # Defensive: worm_family must never reach as.integer() as NULL/zero-length.
+  # If a caller upstream fails to pass it through, fall back to Negative
+  # Binomial (0L) rather than producing a zero-length DATA_INTEGER that
+  # MakeADFun rejects with "Expected scalar. Got length=0".
+  if (is.null(worm_family) || length(worm_family) == 0)
+    worm_family <- 0L
+  worm_family_int <- as.integer(worm_family)   # 0 = negbin, 1 = poisson
 
   n         <- length(y_counts)
   n_loc     <- nrow(coords)
@@ -484,6 +497,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     dist_vec             = dist_vec,
     n_loc                = as.integer(n_loc),
     gamma_sens           = gamma_sens,
+    worm_family          = worm_family_int,
     fix_omega            = as.integer(!is.null(fix_k)),
     fixed_omega_val      = if (!is.null(fix_k)) as.numeric(fix_k) else 0.0,
     use_mda              = as.integer(use_mda),
@@ -515,14 +529,24 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     # MakeADFun still needs a finite starting value.
     log_omega     = log(if (!is.null(fix_k)) fix_k
                         else if (!is.null(par0$k) && is.finite(par0$k)) par0$k
-                        else 1.0),    log_alpha     = log(par0$rho),
+                        else 1.0),
+    log_alpha     = log(par0$rho),
     logit_alpha_W = if (use_mda) qlogis(par0$alpha_W) else 0.0,
     log_gamma_W   = if (use_mda) log(par0$gamma_W)    else 0.0
   )
 
   map_list <- list()
   if (!is.null(fix_tau2)) map_list$log_nu2   <- factor(NA)
-  if (!is.null(fix_k))    map_list$log_omega <- factor(NA)
+
+  # omega is only active under the Negative Binomial branch, and only
+  # when it isn't separately fixed via fix_k.
+  if (worm_family_int == 1L) {
+    tmb_params$log_omega <- 0.0
+    map_list$log_omega   <- factor(NA)
+  } else if (!is.null(fix_k)) {
+    map_list$log_omega <- factor(NA)
+  }
+
   if (!use_mda) {
     map_list$logit_alpha_W <- factor(NA)
     map_list$log_gamma_W   <- factor(NA)
@@ -549,6 +573,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
   )
   obj_d$fn()
   log_denom <- obj_d$report()$log_f_vals
+  rm(obj_d); gc()   # release the denominator tape before building the main objective
 
   if (messages) message("  Building MCML objective (lf_mdiag)...")
   obj <- TMB::MakeADFun(
@@ -579,7 +604,13 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     sigma2 = ge("sigma2"),
     phi    = ge("phi"),
     tau2   = if (!is.null(fix_tau2)) fix_tau2 else ge("tau2"),
-    k      = if (!is.null(fix_k)) fix_k else ge("omega"),
+    # 'k' (omega) does not exist in ADREPORT under Poisson (see
+    # dsgm_mdiag.cpp: only ADREPORT'd when !poisson_worm). Report Inf so
+    # downstream code that reads coef(fit)$k still works: the NB
+    # prevalence formula 1-(k/(k+mu*c))^k -> 1-exp(-mu*c) as k -> Inf
+    # in ordinary R arithmetic.
+    k      = if (worm_family_int == 1L) Inf
+    else if (!is.null(fix_k)) fix_k else ge("omega"),
     rho    = ge("alpha")
   )
   params_se <- list(
@@ -587,7 +618,8 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     sigma2 = gse("sigma2"),
     phi    = gse("phi"),
     tau2   = if (!is.null(fix_tau2)) NA else gse("tau2"),
-    k      = if (!is.null(fix_k)) NA else gse("omega"),
+    k      = if (worm_family_int == 1L || !is.null(fix_k)) NA
+    else gse("omega"),
     rho    = gse("alpha")
   )
   if (use_mda) {
@@ -599,6 +631,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     params            = params,
     params_se         = params_se,
     vary_k            = FALSE,
+    worm_family       = if (worm_family_int == 1L) "poisson" else "negbin",
     convergence       = opt$convergence,
     log_likelihood    = -opt$objective,
     message           = opt$message,

@@ -6,14 +6,30 @@
 // S at fixed parameter values theta_0, which are then passed to the TMB
 // MCML engine (dsgm_mdiag.cpp) for parameter estimation.
 //
-// Two Binomial outcomes per observation, sharing a latent NB worm burden
-// driven by a log-Gaussian spatial process S(x):
+// Two Binomial outcomes per observation, sharing a latent worm burden
+// driven by a log-Gaussian spatial process S(x).
 //
+// worm_family == 0 (Negative Binomial, default):
 //   Parasitological (is_mf[i] == 1):
 //     P(Y > 0) = 1 - [omega / (omega + mu*(1-exp(-alpha)))]^omega
-//
 //   Serological (is_mf[i] == 0):
 //     P(Y = 1) = gamma_sens * {1 - [omega / (omega + mu)]^omega}
+//
+// worm_family == 1 (Poisson):
+//   The omega -> infinity limit of the above, evaluated exactly rather than
+//   via a large finite omega (which suffers catastrophic cancellation in
+//   pow(omega/(omega + mu*c), omega)):
+//     Parasitological : P(Y > 0) = 1 - exp(-mu*(1-exp(-alpha)))
+//     Serological     : P(Y = 1) = gamma_sens * {1 - exp(-mu)}
+//   omega is inactive in this branch. It must still be passed as data (Stan
+//   requires all declared data), but its value is never read -- pass any
+//   finite positive dummy (e.g. 1.0), NOT Inf, which would fail Stan's
+//   <lower=0> validation.
+//
+// This flag must match the worm_family passed to dsgm_mdiag.cpp. If the Stan
+// proposal targets the NB posterior while TMB evaluates the Poisson
+// likelihood (or vice versa), the importance sampler is still formally valid
+// but the weights degrade badly, collapsing the effective sample size.
 //
 // Optional MDA effect (use_mda == 1):
 //   mu_W[i] = exp(eta[i]) * mda_impact[i]
@@ -31,8 +47,10 @@
 
 functions {
 
+  // ---- Negative Binomial branch --------------------------------------------
+
   // P(detect >= 1 MF) via NB PGF evaluated at exp(-alpha)
-  real p_mf(real mu_W, real omega, real alpha) {
+  real p_mf_nb(real mu_W, real omega, real alpha) {
     real c_alpha = 1.0 - exp(-alpha);
     real ratio   = omega / (omega + mu_W * c_alpha);
     real pr      = 1.0 - pow(ratio, omega);
@@ -42,9 +60,26 @@ functions {
   }
 
   // P(detect antigen) -- sensitivity-adjusted NB zero probability
-  real p_cfa(real mu_W, real omega, real gamma_sens) {
+  real p_cfa_nb(real mu_W, real omega, real gamma_sens) {
     real ratio = omega / (omega + mu_W);
     real pr    = gamma_sens * (1.0 - pow(ratio, omega));
+    pr = fmax(pr, 1e-10);
+    pr = fmin(pr, 1.0 - 1e-10);
+    return pr;
+  }
+
+  // ---- Poisson branch (exact omega -> infinity limit) ----------------------
+
+  real p_mf_pois(real mu_W, real alpha) {
+    real c_alpha = 1.0 - exp(-alpha);
+    real pr      = 1.0 - exp(-mu_W * c_alpha);
+    pr = fmax(pr, 1e-10);
+    pr = fmin(pr, 1.0 - 1e-10);
+    return pr;
+  }
+
+  real p_cfa_pois(real mu_W, real gamma_sens) {
+    real pr = gamma_sens * (1.0 - exp(-mu_W));
     pr = fmax(pr, 1e-10);
     pr = fmin(pr, 1.0 - 1e-10);
     return pr;
@@ -74,10 +109,14 @@ data {
   // Fixed-effects linear predictor: D * beta  (computed in R, passed as data)
   vector[n] eta_fixed;
 
+  // Latent worm burden family: 0 = Negative Binomial, 1 = Poisson.
+  // Must match the worm_family used in dsgm_mdiag.cpp.
+  int<lower=0, upper=1>  worm_family;
+
   // Fixed parameters at theta_0
   real<lower=0>          sigma2;      // GP variance
   real<lower=0>          phi;         // GP range
-  real<lower=0>          omega;       // NB aggregation parameter
+  real<lower=0>          omega;       // NB aggregation parameter (unused if worm_family == 1)
   real<lower=0>          alpha;       // MF detection rate per worm
   real<lower=0,upper=1>  gamma_sens;  // Serological sensitivity (fixed by user)
 
@@ -129,11 +168,21 @@ transformed parameters {
     real eta_i = eta_fixed[i] + S[ID_coords[i]];
     mu_W[i] = use_mda ? exp(eta_i) * mda_impact[i] : exp(eta_i);
 
-    // Detection probability depends on diagnostic type
-    if (is_mf[i] == 1) {
-      prob[i] = p_mf(mu_W[i], omega, alpha);
+    // Detection probability depends on diagnostic type and worm-burden family
+    if (worm_family == 1) {
+      // Poisson (exact omega -> infinity limit); omega is not read here
+      if (is_mf[i] == 1) {
+        prob[i] = p_mf_pois(mu_W[i], alpha);
+      } else {
+        prob[i] = p_cfa_pois(mu_W[i], gamma_sens);
+      }
     } else {
-      prob[i] = p_cfa(mu_W[i], omega, gamma_sens);
+      // Negative Binomial
+      if (is_mf[i] == 1) {
+        prob[i] = p_mf_nb(mu_W[i], omega, alpha);
+      } else {
+        prob[i] = p_cfa_nb(mu_W[i], omega, gamma_sens);
+      }
     }
   }
 
