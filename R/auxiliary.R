@@ -360,43 +360,9 @@ interpret.formula <- function(formula) {
 }
 
 
-##' @title Extract Parameter Estimates from a "RiskMapNTDtest" Model Fit
-##' @description This \code{coef} method for the "RiskMapNTDtest" class extracts the
-##' maximum likelihood estimates from model fits obtained from the \code{\link{glgpm}} or \code{\link{dsgm}} functions.
-##' @param object An object of class "RiskMapNTDtest" obtained as a result of a call to \code{\link{glgpm}} or \code{\link{dsgm}}.
-##' @param ... other parameters.
-##' @return A list containing the maximum likelihood estimates. For standard models:
-##' \item{beta}{A vector of coefficient estimates.}
-##' \item{sigma2}{The estimate for the variance parameter \eqn{\sigma^2}.}
-##' \item{phi}{The estimate for the spatial range parameter \eqn{\phi}.}
-##' \item{tau2}{The estimate for the nugget effect parameter \eqn{\tau^2}, if applicable.}
-##' \item{sigma2_me}{The estimate for the measurement error variance \eqn{\sigma^2_{me}}, if applicable.}
-##' \item{sigma2_re}{A vector of variance estimates for the random effects, if applicable.}
-##' For STH DSGM models (\code{family = "intprev"}):
-##' \item{beta}{Coefficient estimates for log mean worm burden.}
-##' \item{k}{Negative binomial overdispersion parameter.}
-##' \item{rho}{Egg detection rate (fecundity).}
-##' \item{alpha_W}{Immediate worm burden reduction from MDA (if estimated or fixed).}
-##' \item{gamma_W}{Decay rate of MDA effect (if estimated or fixed).}
-##' \item{sigma2}{Spatial process variance.}
-##' \item{phi}{Spatial correlation scale.}
-##' For LF DSGM models (\code{family = "lf_mdiag"}):
-##' \item{beta}{Coefficient estimates for log mean worm burden.}
-##' \item{k}{Negative binomial overdispersion parameter.}
-##' \item{rho}{Per-worm MF detection rate.}
-##' \item{gamma_sens}{Serological test sensitivity (fixed by user).}
-##' \item{tau2}{Nugget variance (if estimated).}
-##' \item{alpha_W}{Immediate worm burden reduction from MDA (if used).}
-##' \item{gamma_W}{Decay rate of MDA effect (if used).}
-##' \item{sigma2}{Spatial process variance.}
-##' \item{phi}{Spatial correlation scale.}
-##' @author Emanuele Giorgi \email{e.giorgi@@lancaster.ac.uk}
-##' @author Claudio Fronterre \email{c.fronterr@@lancaster.ac.uk}
-##' @seealso \code{\link{glgpm}}, \code{\link{dsgm}}
-##' @method coef RiskMapNTDtest
-##' @export
-##'
 coef.RiskMapNTDtest <- function(object, ...) {
+
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
 
   # ===========================================================================
   # DSGM MODELS: intprev (STH) and lf_mdiag (LF)
@@ -424,7 +390,18 @@ coef.RiskMapNTDtest <- function(object, ...) {
 
     res        <- list()
     res$beta   <- beta_est
-    if(object$vary_k) {
+
+    # LF fits may use a Poisson latent worm burden (omega -> infinity
+    # limit). In that case there is no aggregation parameter: force k to
+    # Inf here regardless of what params$k happens to hold, so coef() is
+    # correct even if the upstream fit object was built before this guard
+    # existed elsewhere in the package.
+    is_poisson_lf <- identical(object$family, "lf_mdiag") &&
+      identical(object$worm_family %||% "negbin", "poisson")
+
+    if (is_poisson_lf) {
+      res$k <- Inf
+    } else if (object$vary_k) {
       res$k      <- as.numeric(params$k)
       res$omega1 <- as.numeric(params$omega1)
     } else {
@@ -461,7 +438,7 @@ coef.RiskMapNTDtest <- function(object, ...) {
   }
 
   # ===========================================================================
-  # STANDARD RISKMAPNTDTEST MODEL (glgpm / dast)
+  # STANDARD RISKMAPNTDTEST MODEL (glgpm / dast)  -- unchanged
   # ===========================================================================
 
   n_re <- length(object$re)
@@ -596,6 +573,12 @@ summary.RiskMapNTDtest <- function(object, ..., conf_level = 0.95) {
     params <- object$model_params
     p      <- length(params$beta)
 
+    # LF fits may use a Poisson latent worm burden (omega -> infinity limit).
+    # In that case there is no aggregation parameter: it is not estimated,
+    # not ADREPORT'd by the TMB template, and params$k / params_se$k come
+    # back as Inf / NA respectively (see .dsgm_fit_tmb_lf_mdiag()).
+    pois_flag <- identical(object$worm_family, "poisson")
+
     # -- Standard errors -------------------------------------------------------
     if (!is.null(object$params_se)) {
       params_se <- object$params_se
@@ -606,7 +589,9 @@ summary.RiskMapNTDtest <- function(object, ..., conf_level = 0.95) {
       b_idx     <- grep("^beta", rownames(fix_s))
       params_se <- list(
         beta   = as.numeric(fix_s[b_idx, "Std. Error"]),
-        k      = as.numeric(rep_s["k",      "Std. Error"]),
+        # "k" (omega) is not ADREPORT'd under the Poisson branch of the TMB
+        # template, so rep_s["k", ...] would error there.
+        k      = if (pois_flag) NA_real_ else as.numeric(rep_s["k", "Std. Error"]),
         omega1 = if(object$vary_k) as.numeric(rep_s["omega1","Std. Error"]) else NULL,
         rho    = as.numeric(rep_s["rho",    "Std. Error"]),
         sigma2 = as.numeric(rep_s["sigma2", "Std. Error"]),
@@ -662,9 +647,15 @@ summary.RiskMapNTDtest <- function(object, ..., conf_level = 0.95) {
     }
     res$sp <- sp_rows
 
-    # ---- 3. NB worm burden parameters (k and rho) ---------------------------
-    res$vary_k <- object$vary_k
-    if(!object$vary_k) {
+    # ---- 3. Worm burden parameters (k and rho) -------------------------------
+    res$vary_k      <- object$vary_k
+    res$worm_family <- object$worm_family %||% "negbin"
+
+    if (pois_flag) {
+      # omega -> infinity limit: no aggregation parameter exists to report.
+      # lnCI(Inf, NA) would otherwise produce a row of Inf/NaN.
+      res$overdispersion <- NULL
+    } else if (!object$vary_k) {
       res$overdispersion <- rbind(
         "Aggregation param." = lnCI(params$k, params_se$k)
       )
@@ -745,7 +736,7 @@ summary.RiskMapNTDtest <- function(object, ..., conf_level = 0.95) {
   }
 
   # ===========================================================================
-  # STANDARD RISKMAPNTDTEST MODELS (glgpm / DAST)
+  # STANDARD RISKMAPNTDTEST MODELS (glgpm / DAST)  -- unchanged
   # ===========================================================================
 
   link_name <- NULL
@@ -944,7 +935,6 @@ summary.RiskMapNTDtest <- function(object, ..., conf_level = 0.95) {
   return(res)
 }
 
-
 ##' @title Print Summary of RiskMapNTDtest Model
 ##' @description Print method for objects of class \code{"summary.RiskMapNTDtest"}.
 ##' @param x An object of class \code{"summary.RiskMapNTDtest"}.
@@ -953,6 +943,8 @@ summary.RiskMapNTDtest <- function(object, ..., conf_level = 0.95) {
 ##' @method print summary.RiskMapNTDtest
 ##' @export
 print.summary.RiskMapNTDtest <- function(x, ...) {
+
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
 
   if (!is.null(x$call)) {
     cat("Call:\n")
@@ -965,12 +957,15 @@ print.summary.RiskMapNTDtest <- function(x, ...) {
 
   if (isTRUE(x$is_dsgm)) {
 
+    worm_label <- if (identical(x$worm_family %||% "negbin", "poisson"))
+      "Poisson" else "Negative Binomial"
+
     if (identical(x$family, "lf_mdiag")) {
       cat("Doubly stochastic geostatistical model: multiple diagnostics\n")
-      cat("Latent worm burden: Negative Binomial\n\n")
+      cat(sprintf("Latent worm burden: %s\n\n", worm_label))
     } else {
       cat("Doubly stochastic geostatistical model\n")
-      cat("Latent worm burden: Negative Binomial\n")
+      cat(sprintf("Latent worm burden: %s\n", worm_label))
       # Show intensity likelihood family
       fam_label <- if (identical(x$intensity_family, "negbin"))
         "zero-truncated Negative Binomial (moment-matched)"
@@ -995,10 +990,16 @@ print.summary.RiskMapNTDtest <- function(x, ...) {
     cat("Exponential covariance function (kappa = ", x$kappa, ")\n", sep = "")
     printCoefmat(x$sp, P.values = FALSE, has.Pvalue = FALSE)
 
-    # ---- NB worm burden parameters ------------------------------------------
-    cat("\nNegative binomial worm burden\n")
-    printCoefmat(rbind(x$overdispersion, x$fecundity),
-                 P.values = FALSE, has.Pvalue = FALSE)
+    # ---- Worm burden parameters ----------------------------------------------
+    # x$overdispersion is NULL when worm_family == "poisson" (no aggregation
+    # parameter exists in that limit); print only rho in that case.
+    cat(sprintf("\n%s worm burden\n", worm_label))
+    if (!is.null(x$overdispersion)) {
+      printCoefmat(rbind(x$overdispersion, x$fecundity),
+                   P.values = FALSE, has.Pvalue = FALSE)
+    } else {
+      printCoefmat(x$fecundity, P.values = FALSE, has.Pvalue = FALSE)
+    }
 
     # LF extras
     if (identical(x$family, "lf_mdiag")) {
@@ -1029,7 +1030,7 @@ print.summary.RiskMapNTDtest <- function(x, ...) {
   }
 
   # ===========================================================================
-  # STANDARD RISKMAPNTDTEST MODELS
+  # STANDARD RISKMAPNTDTEST MODELS  -- unchanged
   # ===========================================================================
 
   if (identical(x$family, "gaussian")) {

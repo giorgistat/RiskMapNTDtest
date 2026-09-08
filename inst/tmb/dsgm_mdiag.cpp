@@ -6,13 +6,21 @@
 // TMB template for the doubly stochastic geostatistical model with
 // multiple diagnostics (lf_mdiag).
 //
-// Two Binomial outcomes per observation sharing a latent NB worm burden:
+// Two Binomial outcomes per observation sharing a latent worm burden.
 //
+// worm_family == 0 (Negative Binomial, default):
 //   Parasitological (is_mf == 1):
 //     P(Y > 0) = 1 - [omega / (omega + mu*(1-exp(-alpha)))]^omega
-//
 //   Serological (is_mf == 0):
 //     P(Y = 1) = gamma_sens * {1 - [omega / (omega + mu)]^omega}
+//
+// worm_family == 1 (Poisson):
+//   The omega -> infinity limit of the above, evaluated exactly rather than
+//   via a large fixed omega (which suffers catastrophic cancellation in
+//   exp(omega*(log(omega) - log(omega + mu*c)))):
+//     Parasitological : P(Y > 0) = 1 - exp(-mu*(1-exp(-alpha)))
+//     Serological     : P(Y = 1) = gamma_sens * {1 - exp(-mu)}
+//   omega is inactive in this branch and must be mapped out from the R side.
 //
 // Optional MDA effect (use_mda == 1):
 //   mu_W(i) = mu_W_star(i) * phi(i)
@@ -27,38 +35,18 @@
 //   Step 2: compute_denominator_only = 0  -> MCML objective
 //
 // -----------------------------------------------------------------------------
-// MEMORY / TAPE NOTES (rewrite of the original dense-Cholesky version)
+// MEMORY / TAPE NOTES
 // -----------------------------------------------------------------------------
-// The previous implementation formed an Eigen::LLT of the n_loc x n_loc
-// correlation matrix in AD arithmetic, then performed one triangular solve
-// *per Monte Carlo sample*. Because every scalar operation of a dense
-// factorisation and of every solve is recorded on the CppAD tape, the tape
-// grew like
+// The dense-Cholesky version formed an Eigen::LLT of the n_loc x n_loc
+// correlation matrix in AD arithmetic, then ran one triangular solve per Monte
+// Carlo sample, giving a tape of O(n_loc^3) + O(n_samples * n_loc^2). At
+// n_loc = 1214, n_samples = 1000 that is ~1e9 recorded operations and fails
+// with std::bad_alloc at MakeADFun time.
 //
-//     O(n_loc^3)  +  O(n_samples * n_loc^2)
-//
-// For n_loc = 1214 and n_samples = 1000 that is ~1e9 recorded operations,
-// which exhausts memory (std::bad_alloc) at MakeADFun time.
-//
-// This version instead:
-//   (1) uses atomic::matinvpd() for the inverse and log-determinant, so the
-//       whole factorisation is a SINGLE tape node with an analytic reverse
-//       rule (exact derivatives, not an approximation);
-//   (2) computes ALL quadratic forms in one batched atomic matrix product
-//         M = R^{-1} S^T          (n_loc x n_samples, one tape node)
-//       and then recovers quad(s) = sum_i S(s,i) * M(i,s), which is only
-//       O(n_samples * n_loc) taped multiply-adds;
-//   (3) replaces pow(a, omega) with exp(omega * log(a)) and hoists log(omega),
-//       1/phi and 1/sigma2 out of the inner loops.
-//
-// Resulting tape is dominated by the Binomial likelihood loop, O(n * n_samples),
-// rather than by the linear algebra -- roughly a 50-70x reduction in tape size.
-//
-// NOTE: atomic::matinvpd forms an explicit inverse rather than keeping a
-// Cholesky factor. With the nugget on the diagonal (R(i,i) = 1 + nu2) this is
-// well conditioned in normal use, but if nu2 is driven to ~0 while phi is large
-// the correlation matrix can become near-singular. If that occurs, bound nu2
-// away from zero (or fix tau2) rather than reverting to the dense LLT.
+// This version uses atomic::matinvpd() for the inverse and log-determinant
+// (single tape node, analytic reverse rule, exact derivatives), and batches all
+// quadratic forms into one atomic::matmul, reducing the quadratic-form cost to
+// O(n_samples * n_loc) taped multiply-adds.
 // =============================================================================
 
 template<class Type>
@@ -90,6 +78,7 @@ Type objective_function<Type>::operator() ()
 
   DATA_SCALAR(gamma_sens);  // Fixed sensitivity of serological test
 
+  DATA_INTEGER(worm_family);      // 0 = Negative Binomial, 1 = Poisson
   DATA_INTEGER(fix_omega);        // 0 = estimate omega, 1 = fix to fixed_omega_val
   DATA_SCALAR(fixed_omega_val);
 
@@ -125,7 +114,7 @@ Type objective_function<Type>::operator() ()
   PARAMETER(log_sigma2);
   PARAMETER(log_phi);
   PARAMETER(log_nu2);          // log(tau2 / sigma2)
-  PARAMETER(log_omega);        // ignored when fix_omega == 1
+  PARAMETER(log_omega);        // inactive when worm_family == 1 or fix_omega == 1
   PARAMETER(log_alpha);        // log MF detection rate per worm
 
   // MDA parameters (declared always; inactive when use_mda == 0)
@@ -140,6 +129,8 @@ Type objective_function<Type>::operator() ()
   const Type alpha   = exp(log_alpha);
   const Type alpha_W = Type(1.0) / (Type(1.0) + exp(-logit_alpha_W));
   const Type gamma_W = exp(log_gamma_W);
+
+  const bool poisson_worm = (worm_family == 1);
 
   int n         = y.size();
   int n_samples = S_samples.rows();
@@ -164,9 +155,6 @@ Type objective_function<Type>::operator() ()
 
   // ===========================================================================
   // CORRELATION MATRIX R
-  //
-  // Built once. Hoisting 1/phi out of the loop keeps this to ~2 taped
-  // operations per off-diagonal element (one multiply, one exp).
   // ===========================================================================
 
   const Type inv_phi = Type(1.0) / phi;
@@ -181,31 +169,11 @@ Type objective_function<Type>::operator() ()
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Atomic inverse + log-determinant.
-  //
-  // atomic::matinvpd() records the entire positive-definite factorisation as a
-  // single tape node, supplying its own analytic reverse-mode rule. Derivatives
-  // w.r.t. phi, nu2 remain exact; the O(n_loc^3) scalar operations are executed
-  // in double precision and never taped.
-  //
-  // Sign convention matches TMB's density::MVNORM_t: log_det_R = log|R|.
-  // ---------------------------------------------------------------------------
   Type log_det_R;
   matrix<Type> Rinv = atomic::matinvpd(R, log_det_R);
 
   // ===========================================================================
-  // BATCHED QUADRATIC FORMS
-  //
-  //   quad(s) = S_s' R^{-1} S_s
-  //
-  // Computing these one at a time costs O(n_loc^2) taped operations per sample.
-  // Instead form
-  //     M = R^{-1} S^T        (n_loc x n_samples)
-  // as ONE atomic matrix product, then contract:
-  //     quad(s) = sum_i S^T(i,s) * M(i,s)
-  // which is only O(n_samples * n_loc) taped multiply-adds. S_samples is data,
-  // so each term is (constant * AD) -- a single node.
+  // BATCHED QUADRATIC FORMS   quad(s) = S_s' R^{-1} S_s
   // ===========================================================================
 
   matrix<Type> St = S_samples.transpose();      // n_loc x n_samples
@@ -224,20 +192,15 @@ Type objective_function<Type>::operator() ()
 
   vector<Type> mu_fixed = D * beta + cov_offset;
 
-  const Type c_alpha    = Type(1.0) - exp(-alpha);
-  const Type log_omega_v = log(omega);      // hoisted out of the sample loop
+  const Type c_alpha     = Type(1.0) - exp(-alpha);
+  const Type log_omega_v = poisson_worm ? Type(0.0) : log(omega);
   const Type inv_sigma2  = Type(1.0) / sigma2;
   const Type eps         = Type(1e-10);
 
-  // Constant part of the GP log-prior (independent of s)
   const Type log_prior_const = Type(n_loc) * log_sigma2 + log_det_R;
 
   // ===========================================================================
   // MONTE CARLO LOOP
-  //
-  // This is now the dominant contributor to the tape, at O(n * n_samples).
-  // pow(a, omega) is written as exp(omega * log(a)) to avoid CppAD's generic
-  // pow expansion, and log(omega) is hoisted above.
   // ===========================================================================
 
   vector<Type> log_f_vals(n_samples);
@@ -251,12 +214,21 @@ Type objective_function<Type>::operator() ()
       Type mu_W = exp(mu_fixed(i) + S_samples(s, ID_coords(i))) * mda_effect(i);
 
       Type p;
-      if (is_mf(i) == 1) {
-        // Parasitological: 1 - [omega/(omega + mu*c_alpha)]^omega
-        p = Type(1.0) - exp(omega * (log_omega_v - log(omega + mu_W * c_alpha)));
+      if (poisson_worm) {
+        // Exact omega -> infinity limit
+        if (is_mf(i) == 1) {
+          p = Type(1.0) - exp(-mu_W * c_alpha);
+        } else {
+          p = gamma_sens * (Type(1.0) - exp(-mu_W));
+        }
       } else {
-        // Serological: gamma_sens * {1 - [omega/(omega + mu)]^omega}
-        p = gamma_sens * (Type(1.0) - exp(omega * (log_omega_v - log(omega + mu_W))));
+        if (is_mf(i) == 1) {
+          // 1 - [omega/(omega + mu*c_alpha)]^omega
+          p = Type(1.0) - exp(omega * (log_omega_v - log(omega + mu_W * c_alpha)));
+        } else {
+          // gamma_sens * {1 - [omega/(omega + mu)]^omega}
+          p = gamma_sens * (Type(1.0) - exp(omega * (log_omega_v - log(omega + mu_W))));
+        }
       }
 
       p = CppAD::CondExpLt(p, eps, eps, p);
@@ -289,15 +261,10 @@ Type objective_function<Type>::operator() ()
   vector<Type> ef  = exp(log_f_vals - max_lf);
   Type mc_loglik   = log(ef.mean()) + max_lf;
 
-  // ---------------------------------------------------------------------------
-  // Importance-sampling effective sample size, reported for diagnostics.
-  //   ESS = (sum w)^2 / sum(w^2),  w_s = exp(log_f_vals(s) - max)
-  // A collapse of ESS relative to n_samples indicates the optimiser has drifted
-  // too far from theta_0 for the current proposal to support it.
-  // ---------------------------------------------------------------------------
-  Type sum_w   = ef.sum();
-  Type sum_w2  = (ef * ef).sum();
-  Type ess     = (sum_w * sum_w) / sum_w2;
+  // Importance-sampling effective sample size, for diagnostics.
+  Type sum_w  = ef.sum();
+  Type sum_w2 = (ef * ef).sum();
+  Type ess    = (sum_w * sum_w) / sum_w2;
   REPORT(ess);
   REPORT(log_f_vals);
 
@@ -311,11 +278,9 @@ Type objective_function<Type>::operator() ()
 
     if (use_alpha_W_penalty == 1) {
       if (alpha_W_penalty_type == 1) {
-        // Beta(a, b) on alpha_W
         penalty -= (alpha_W_param1 - Type(1.0)) * log(alpha_W);
         penalty -= (alpha_W_param2 - Type(1.0)) * log(Type(1.0) - alpha_W);
       } else if (alpha_W_penalty_type == 2) {
-        // Normal(mean, sd) on logit(alpha_W)
         Type d = logit_alpha_W - alpha_W_param1;
         penalty += Type(0.5) * d * d / (alpha_W_param2 * alpha_W_param2);
       }
@@ -323,7 +288,6 @@ Type objective_function<Type>::operator() ()
 
     if (use_gamma_W_penalty == 1) {
       if (gamma_W_penalty_type == 1) {
-        // Gamma(shape, rate) on gamma_W
         penalty -= (gamma_W_param1 - Type(1.0)) * log(gamma_W);
         penalty += gamma_W_param2 * gamma_W;
       } else if (gamma_W_penalty_type == 2) {
@@ -344,10 +308,12 @@ Type objective_function<Type>::operator() ()
 
   ADREPORT(sigma2);
   ADREPORT(phi);
-  ADREPORT(omega);
   ADREPORT(alpha);
   Type tau2 = nu2 * sigma2;
   ADREPORT(tau2);
+
+  // omega only exists in the Negative Binomial branch
+  if (!poisson_worm) ADREPORT(omega);
 
   if (use_mda == 1) {
     ADREPORT(alpha_W);

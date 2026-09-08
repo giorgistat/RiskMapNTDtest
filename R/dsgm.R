@@ -241,6 +241,7 @@ sample_spatial_process_stan_lf <- function(y_counts,
                                            ID_coords,
                                            par,
                                            mda_impact    = NULL,
+                                           worm_family   = 0L,      # <-- NEW
                                            n_samples     = 1000,
                                            n_warmup      = 1000,
                                            n_chains      = 4,
@@ -257,31 +258,39 @@ sample_spatial_process_stan_lf <- function(y_counts,
   if (is.null(mda_impact)) mda_impact <- rep(1.0, n)
   use_mda_flag <- as.integer(!all(mda_impact == 1.0))
 
+  worm_family_int <- as.integer(worm_family)
+
+  # omega is unused when worm_family == 1, but Stan still validates it as
+  # <lower=0>, so Inf (or a non-finite par$k) must not be passed through.
+  omega_val <- if (worm_family_int == 1L || !is.finite(par$k)) 1.0 else par$k
+
   stan_data <- list(
-    n          = n,
-    n_loc      = n_loc,
-    p          = p,
-    y          = as.integer(y_counts),
-    units_m    = as.integer(units_m),
-    is_mf      = as.integer(which_diag),
-    ID_coords  = as.integer(ID_coords),
-    D_mat      = as.matrix(dist(coords)),
-    eta_fixed  = as.numeric(D %*% par$beta),
-    mda_impact = as.numeric(mda_impact),
-    use_mda    = use_mda_flag,
-    omega      = par$k,
-    alpha      = par$rho,
-    gamma_sens = par$gamma_sens,
-    sigma2     = par$sigma2,
-    phi        = par$phi
+    n           = n,
+    n_loc       = n_loc,
+    p           = p,
+    y           = as.integer(y_counts),
+    units_m     = as.integer(units_m),
+    is_mf       = as.integer(which_diag),
+    ID_coords   = as.integer(ID_coords),
+    D_mat       = as.matrix(dist(coords)),
+    eta_fixed   = as.numeric(D %*% par$beta),
+    mda_impact  = as.numeric(mda_impact),
+    use_mda     = use_mda_flag,
+    worm_family = worm_family_int,     # <-- NEW
+    omega       = omega_val,           # <-- guarded
+    alpha       = par$rho,
+    gamma_sens  = par$gamma_sens,
+    sigma2      = par$sigma2,
+    phi         = par$phi
   )
 
   mod     <- get_stan_model(model = "lf", backend = backend, messages = messages)
   backend <- mod$backend
 
   if (messages)
-    message(sprintf("Sampling %d iter (%d warmup), %d chain(s) [lf_mdiag]...",
-                    n_samples + n_warmup, n_warmup, n_chains))
+    message(sprintf("Sampling %d iter (%d warmup), %d chain(s) [lf_mdiag, worm=%s]...",
+                    n_samples + n_warmup, n_warmup, n_chains,
+                    ifelse(worm_family_int == 1L, "poisson", "negbin")))
 
   fit       <- .run_stan(mod$model, backend, stan_data,
                          n_samples, n_warmup, n_chains, n_cores,
@@ -506,11 +515,19 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
 ##'   Default is 0.5, consistent with estimates from Kenya hookworm survey data.
 ##' @param intensity_family Distribution for C | C > 0 (STH model only).
 ##'   \code{"gamma"} (default) = shifted Gamma; \code{"negbin"} = zero-truncated NegBin.
+##' @param worm_family Distribution for the latent worm burden (LF model only).
+##'   \code{"negbin"} (default) = Negative Binomial, with aggregation parameter
+##'   \eqn{\omega} estimated (or fixed via \code{fix_k}). \code{"poisson"} = the
+##'   \eqn{\omega \to \infty} limit, evaluated exactly (not via a large fixed
+##'   \code{fix_k}, which is numerically unstable). \eqn{\omega} is inactive
+##'   and not estimated in this case. Ignored with a warning if \code{model !=
+##'   "lf_mdiag"}.
 ##' @export
 dsgm <- function(formula,
                  data,
                  model            = c("sth", "lf_mdiag"),
                  intensity_family = c("gamma", "negbin"),
+                 worm_family      = c("negbin", "poisson"),   # <-- NEW
                  time             = NULL,
                  mda_times        = NULL,
                  int_mat          = NULL,
@@ -521,8 +538,8 @@ dsgm <- function(formula,
                  penalty          = NULL,
                  drop_W           = NULL,
                  decay_W          = NULL,
-                 vary_k           = FALSE,       # <-- NEW
-                 omega1_start     = 0.5,         # <-- NEW
+                 vary_k           = FALSE,
+                 omega1_start     = 0.5,
                  crs              = NULL,
                  convert_to_crs   = NULL,
                  scale_to_km      = TRUE,
@@ -543,17 +560,27 @@ dsgm <- function(formula,
                                          tau2    = NULL,
                                          alpha_W = NULL,
                                          gamma_W = NULL,
-                                         omega1  = NULL)) {  # <-- omega1 added
+                                         omega1  = NULL)) {
 
   model            <- match.arg(model)
   intensity_family <- match.arg(intensity_family)
   intensity_family_int <- if (intensity_family == "gamma") 0L else 1L
+
+  worm_family     <- match.arg(worm_family)                       # <-- NEW
+  worm_family_int <- if (worm_family == "negbin") 0L else 1L      # <-- NEW
 
   # vary_k only makes sense for the STH model
   if (vary_k && model != "sth") {
     warning("vary_k = TRUE is only supported for model = 'sth'. Ignoring.")
     vary_k <- FALSE
   }
+
+  # worm_family = 'poisson' only makes sense for the LF model              # <-- NEW
+  if (worm_family == "poisson" && model != "lf_mdiag") {                  # <-- NEW
+    warning("worm_family = 'poisson' is only supported for model = 'lf_mdiag'. Ignoring.")  # <-- NEW
+    worm_family     <- "negbin"                                          # <-- NEW
+    worm_family_int <- 0L                                               # <-- NEW
+  }                                                                       # <-- NEW
 
   if (!inherits(formula, "formula"))
     stop("'formula' must be a formula object")
@@ -641,7 +668,7 @@ dsgm <- function(formula,
   }
 
   # ===========================================================================
-  # STH branch
+  # STH branch  (unchanged — worm_family not applicable here)
   # ===========================================================================
   if (model == "sth") {
 
@@ -678,8 +705,8 @@ dsgm <- function(formula,
         penalty           = penalty,
         fix_alpha_W       = fix_alpha_W,
         fix_gamma_W       = fix_gamma_W,
-        vary_k            = vary_k,           # <-- pass through
-        omega1_start      = omega1_start,     # <-- pass through
+        vary_k            = vary_k,
+        omega1_start      = omega1_start,
         start_pars        = start_pars,
         messages          = messages)
     }
@@ -689,11 +716,6 @@ dsgm <- function(formula,
     miss <- setdiff(req, names(par0))
     if (length(miss) > 0)
       stop("Missing initial parameters: ", paste(miss, collapse = ", "))
-
-    # For the Stan sampling step, pass an effective scalar k to the Stan model.
-    # When vary_k = TRUE, k in par0 is omega_0 (k at mu_W = 1). This is an
-    # approximation for the proposal — the TMB step handles the exact likelihood.
-    # No changes to sample_spatial_process_stan() are needed.
 
     if (messages) {
       message("\n=== Sampling spatial process (STH, Stan) ===")
@@ -746,7 +768,7 @@ dsgm <- function(formula,
       penalty           = penalty,
       S_samples_obj     = sp,
       intensity_family  = intensity_family_int,
-      vary_k            = vary_k,             # <-- pass through
+      vary_k            = vary_k,
       omega1_start      = if (!is.null(par0$omega1)) par0$omega1 else omega1_start,
       use_hessian_refinement = TRUE,
       messages          = messages)
@@ -796,7 +818,7 @@ dsgm <- function(formula,
   }
 
   # ===========================================================================
-  # LF multi-diagnostic branch  (UNCHANGED from original)
+  # LF multi-diagnostic branch
   # ===========================================================================
   if (model == "lf_mdiag") {
 
@@ -819,12 +841,21 @@ dsgm <- function(formula,
 
     units_m <- den_vals
 
-    if (messages)
-      message(sprintf("LF data: %d observations (%d MF, %d serological)",
-                      n, sum(which_diag == 1), sum(which_diag == 0)))
+    if (messages) {
+      msg <- sprintf("LF data: %d observations (%d MF, %d serological)",
+                     n, sum(which_diag == 1), sum(which_diag == 0))
+      msg <- paste0(msg, sprintf("  [worm_family: %s]", worm_family))   # <-- NEW
+      message(msg)
+    }
 
     if (is.null(par0)) {
       if (messages) message("\n=== Computing initial parameter values (LF) ===")
+      # NOTE: dsgm_initial_value_lf() is not reprinted here — its source was
+      # not available for editing. Under worm_family = "poisson" it will
+      # still optimise/return a value for 'k', which is harmless (par0$k
+      # is simply ignored downstream once fix_omega/worm_family maps
+      # log_omega out), but it means the initial-value step does slightly
+      # unnecessary work. See note at the end of this listing.
       par0 <- dsgm_initial_value_lf(
         y_counts = y_counts, units_m = units_m, which_diag = which_diag, D = D,
         coords = coords_u,
@@ -851,10 +882,17 @@ dsgm <- function(formula,
       message(sprintf("  n_samples=%d  n_warmup=%d  n_chains=%d  adapt_delta=%.2f",
                       n_samples, n_warmup, n_chains, adapt_delta))
     }
+    # NOTE: sample_spatial_process_stan_lf() and the underlying
+    # dsgm_mdiag.stan template also compute p_mf/p_ag for the spatial-
+    # process proposal. If that Stan file hard-codes the NegBin form, it
+    # needs the same worm_family branch added for the Stan proposal to
+    # stay consistent with the TMB/MCML objective below. Source not
+    # available — not edited here.
     sp <- sample_spatial_process_stan_lf(
       y_counts = y_counts, units_m = units_m, which_diag = which_diag, D = D,
       coords = coords_u, ID_coords = ID_coords, par = par0,
       mda_impact = mda_impact,
+      worm_family = worm_family_int,     # <-- NEW
       n_samples = n_samples, n_warmup = n_warmup,
       n_chains = n_chains, n_cores = 1,
       adapt_delta = adapt_delta, max_treedepth = max_treedepth,
@@ -876,6 +914,7 @@ dsgm <- function(formula,
       cov_offset        = cov_offset,
       gamma_sens        = gamma_sens,
       fix_k             = fix_k,
+      worm_family       = worm_family_int,      # <-- NEW
       use_mda           = use_mda,
       fix_alpha_W       = fix_alpha_W,
       fix_gamma_W       = fix_gamma_W,
@@ -887,6 +926,7 @@ dsgm <- function(formula,
 
     res <- list(
       family            = "lf_mdiag",
+      worm_family       = worm_family,          # <-- NEW
       vary_k            = FALSE,
       y_counts          = y_counts,
       units_m           = units_m,

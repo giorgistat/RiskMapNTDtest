@@ -339,6 +339,7 @@ pred_over_grid <- function(object,
                             gamma_sens = object$gamma_sens,
                             sigma2 = par_hat$sigma2, phi = par_hat$phi),
           mda_impact = mda_impact,
+          worm_family = if (identical(object$worm_family, "poisson")) 1L else 0L,  # <-- NEW
           n_samples  = n_samples_stan,
           n_warmup   = n_warmup_stan,
           n_chains   = n_chains_stan,
@@ -698,19 +699,19 @@ pred_target_grid <- function(object,
       }
 
       f_target <- list(
-        prevalence = function(lp) {
+        mf_prevalence = function(lp) {
           mu_W <- exp(lp)
-          k_i  <- k_fun(mu_W)
-          pr   <- 1 - (k_i / (k_i + mu_W * c_rho))^k_i
-          pmin(pmax(pr, 1e-10), 1 - 1e-10)
+          if (pois) 1 - exp(-mu_W * (1 - exp(-rho)))
+          else      1 - (k / (k + mu_W * (1 - exp(-rho))))^k
         },
-        worm_burden = function(lp) {
-          exp(lp)
+        antigen_prevalence = function(lp) {
+          mu_W <- exp(lp)
+          if (pois) gs * (1 - exp(-mu_W))
+          else      gs * (1 - (k / (k + mu_W))^k)
         },
-        intensity = function(lp) {
-          rho_val * exp(lp)
-        }
+        worm_burden = function(lp) exp(lp)
       )
+
 
       if (vary_k_flag) {
         f_target$aggregation <- function(lp) {
@@ -1661,7 +1662,10 @@ update_predictors <- function(object, predictors) {
 ##'     the latter scaled by the fixed sensitivity \code{gamma_sens}. No
 ##'     hurdle decomposition applies; CRPS/SCRPS/AnPIT are computed directly
 ##'     on this Binomial predictive, exactly as for a \code{glgpm(family =
-##'     "binomial")} fit.
+##'     "binomial")} fit. When the fit used
+##'     \code{worm_family = "poisson"}, the success probabilities are
+##'     evaluated in the exact \eqn{\omega \to \infty} limit rather than via
+##'     the Negative Binomial expression (see below).
 ##' }
 ##' Hurdle-decomposition diagnostics (\code{pos_cal}, \code{AnPIT_cond}) are
 ##' therefore only populated for STH fits; LF fits only populate the standard
@@ -1709,6 +1713,8 @@ assess_pp <- function(object,
                       ...) {
 
   ## ─────────────────────────── helpers ─────────────────────────── ##
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+
   is_list_of_riskmapntdtest <- function(x) {
     is.list(x) && all(vapply(x, inherits, logical(1), what = "RiskMapNTDtest"))
   }
@@ -1907,6 +1913,11 @@ assess_pp <- function(object,
     ## LF (single Binomial likelihood, diagnostic-dependent success prob)
     sth_flag  <- dsgm_flag && identical(fit0$family, "intprev")
     lf_flag   <- dsgm_flag && identical(fit0$family, "lf_mdiag")
+    ## LF fits may use a Poisson latent worm burden (the omega -> infinity
+    ## limit). In that case coef(fit)$k is Inf and the Negative Binomial
+    ## expression evaluates to NaN (Inf/Inf), so the exact limit form must
+    ## be used instead -- see the prediction block below.
+    pois_flag <- lf_flag && identical(fit0$worm_family, "poisson")
 
     if (messages) {
       message(sprintf("\nModel '%s' (%s)", model_names[h], if (dast_flag) {
@@ -1914,7 +1925,7 @@ assess_pp <- function(object,
       } else if (sth_flag) {
         "DSGM (STH)"
       } else if (lf_flag) {
-        "DSGM (LF)"
+        if (pois_flag) "DSGM (LF, Poisson)" else "DSGM (LF, NegBin)"
       } else {
         "GLGM"
       }
@@ -1998,6 +2009,7 @@ assess_pp <- function(object,
               den           = .(as.name(den_name)),
               time          = .(time_sym),
               intensity_family = .(fit0$intensity_family),
+              worm_family   = .(fit0$worm_family %||% "negbin"),
               gamma_sens = .(fit0$gamma_sens),
               mda_times     = .(fit0$mda_times),
               int_mat       = .(fit0$int_mat[in_id, , drop = FALSE]),
@@ -2135,12 +2147,21 @@ assess_pp <- function(object,
 
         } else if (lf_flag) {
           ## LF: single Binomial success probability, diagnostic-dependent
-          agg_W   <- k_i
           gs      <- refit_i$gamma_sens
-          is_mf_i <- fit0$which_diag[out_id]     # 1 = parasitological (MF), 0 = serological
+          is_mf_i <- fit0$which_diag[out_id]   # 1 = parasitological (MF), 0 = serological
 
-          p_mf <- 1 - (agg_W / (agg_W + mu_W * (1 - exp(-rho_i))))^agg_W
-          p_ag <- gs * (1 - (agg_W / (agg_W + mu_W))^agg_W)
+          if (pois_flag) {
+            ## Poisson worm burden: exact omega -> infinity limit.
+            ## k_i is Inf here, so the Negative Binomial expression below
+            ## would evaluate to NaN (Inf/Inf) rather than converging
+            ## numerically to this limit.
+            p_mf <- 1 - exp(-mu_W * (1 - exp(-rho_i)))
+            p_ag <- gs * (1 - exp(-mu_W))
+          } else {
+            agg_W <- k_i
+            p_mf  <- 1 - (agg_W / (agg_W + mu_W * (1 - exp(-rho_i))))^agg_W
+            p_ag  <- gs * (1 - (agg_W / (agg_W + mu_W))^agg_W)
+          }
 
           mu_samp <- p_mf * is_mf_i + p_ag * (1 - is_mf_i)
         }
@@ -2220,7 +2241,8 @@ assess_pp <- function(object,
           if (fam == "binomial" || lf_flag) {
             ## Standard Binomial predictive; also covers the DSGM LF model,
             ## whose success probability (mu_samp) already accounts for the
-            ## MF vs. antigen diagnostic and test sensitivity.
+            ## MF vs. antigen diagnostic, test sensitivity, and the
+            ## NegBin/Poisson worm-burden family.
             y_samp  <- stats::rbinom(n_draw, size = units_m_i[j], prob = mu_samp[j, ])
             support <- 0:units_m_i[j]
           } else if(fam == "poisson") { # Poisson

@@ -21,7 +21,7 @@ assess_pp(
 )
 }
 \arguments{
-\item{object}{A list of `RiskMapNTDtest` objects, each representing a model fitted with `glgpm`.}
+\item{object}{A list of `RiskMapNTDtest` objects, each representing a model fitted with `glgpm`, `dast`, or `dsgm`.}
 
 \item{keep_par_fixed}{Logical; if `TRUE`, parameters are kept fixed across folds, otherwise the model is re-estimated for each fold.}
 
@@ -68,6 +68,8 @@ A list of class `RiskMapNTDtest.spatial.cv`, containing:
       \item{score}{A list with CRPS and/or SCRPS scores for each fold if requested.}
       \item{PIT}{(if `family = "gaussian"` and `which_metric` includes `"AnPIT"`) A list of PIT values for test data.}
       \item{AnPIT}{(if `family` is discrete and `which_metric` includes `"AnPIT"`) A list of AnPIT curves for test data.}
+      \item{pos_cal}{(STH/\code{intprev} DSGM fits only) Per-fold positivity gate calibration.}
+      \item{AnPIT_cond}{(STH/\code{intprev} DSGM fits only, if `which_metric` includes `"AnPIT"`) AnPIT conditional on \eqn{Y>0}.}
     }
   }
 }
@@ -76,9 +78,34 @@ A list of class `RiskMapNTDtest.spatial.cv`, containing:
 This function evaluates the predictive performance of spatial models fitted to `RiskMapNTDtest` objects using cross-validation. It supports two classes of diagnostic tools:
 
 - **Scoring rules**, including the Continuous Ranked Probability Score (CRPS) and its scaled version (SCRPS), which quantify the sharpness and calibration of probabilistic forecasts;
-- **Calibration diagnostics**, based on the Probability Integral Transform (PIT) for Gaussian outcomes and Aggregated nonparametric PIT (AnPIT) curves for discrete outcomes (e.g., Poisson or Binomial).
+- **Calibration diagnostics**, based on the Probability Integral Transform (PIT) for Gaussian outcomes and Aggregated nonparametric PIT (AnPIT) curves for discrete outcomes (e.g., Poisson, Binomial, or the DSGM intensity likelihood).
 
 Cross-validation can be performed using either spatial clustering or regularized subsampling with a minimum inter-point distance. For each fold or subset, models can be refitted or evaluated with fixed parameters, offering flexibility in model validation. The function also provides visualizations of the spatial distribution of test folds.
+}
+\details{
+For DSGM fits (\code{family \%in\% c("intprev", "lf_mdiag")}), the predictive
+distribution differs by sub-model:
+\itemize{
+  \item \strong{STH (\code{family = "intprev"})}: a hurdle process — a
+    Bernoulli gate for egg-positivity followed by a shifted Gamma or
+    zero-truncated NegBin intensity conditional on positivity. In addition
+    to CRPS/SCRPS/AnPIT on the marginal (egg-count) predictive, the
+    function decomposes calibration into (1) the positivity gate
+    (\code{pos_cal}: observed vs. predicted fraction positive per fold,
+    with per-point location IDs for reliability plots) and (2) AnPIT
+    conditional on \eqn{Y>0} (\code{AnPIT_cond}), using only the positive
+    part of the predictive distribution.
+  \item \strong{LF (\code{family = "lf_mdiag"})}: a single Binomial
+    likelihood per observation, with success probability depending on
+    whether the record is parasitological (MF) or serological (antigen),
+    the latter scaled by the fixed sensitivity \code{gamma_sens}. No
+    hurdle decomposition applies; CRPS/SCRPS/AnPIT are computed directly
+    on this Binomial predictive, exactly as for a \code{glgpm(family =
+    "binomial")} fit.
+}
+Hurdle-decomposition diagnostics (\code{pos_cal}, \code{AnPIT_cond}) are
+therefore only populated for STH fits; LF fits only populate the standard
+\code{score} and \code{AnPIT} elements.
 }
 \references{
 Bolin, D., & Wallin, J. (2023). Local scale invariance and robustness of proper scoring rules. *Statistical Science*, 38(1), 140–159. \doi{10.1214/22-STS864}.

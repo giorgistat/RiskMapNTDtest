@@ -19,6 +19,8 @@ dsgm(
   penalty = NULL,
   drop_W = NULL,
   decay_W = NULL,
+  vary_k = FALSE,
+  omega1_start = 0.5,
   crs = NULL,
   convert_to_crs = NULL,
   scale_to_km = TRUE,
@@ -32,12 +34,22 @@ dsgm(
   backend = NULL,
   messages = TRUE,
   start_pars = list(beta = NULL, k = NULL, rho = NULL, sigma2 = NULL, phi = NULL, tau2 =
-    NULL, alpha_W = NULL, gamma_W = NULL)
+    NULL, alpha_W = NULL, gamma_W = NULL, omega1 = NULL)
 )
 }
 \arguments{
 \item{intensity_family}{Distribution for C | C > 0 (STH model only).
 \code{"gamma"} (default) = shifted Gamma; \code{"negbin"} = zero-truncated NegBin.}
+
+\item{vary_k}{Logical (STH model only). If \code{FALSE} (default), the
+NegBin aggregation parameter \eqn{\omega} is constant across all
+observations. If \code{TRUE}, it varies with mean worm burden according to
+\eqn{\log(\omega_i) = \omega_0 + \omega_1 \log(\mu_{W,i})}, adding one
+parameter \eqn{\omega_1}. Motivated by the empirical Coffeng relationship
+whereby more-burdened populations show less aggregation.}
+
+\item{omega1_start}{Starting value for \eqn{\omega_1} when \code{vary_k = TRUE}.
+Default is 0.5, consistent with estimates from Kenya hookworm survey data.}
 }
 \description{
 Fit a Doubly Stochastic Geostatistical Model (DSGM)

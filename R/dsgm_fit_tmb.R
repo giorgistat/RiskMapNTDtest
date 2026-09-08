@@ -145,15 +145,12 @@ convert_penalty_to_tmb <- function(penalty) {
 ##' @title Fit DSGM using TMB
 ##' @description MCML estimation using TMB for automatic differentiation.
 ##'
-##' @param vary_k Logical. If \code{FALSE} (default), the aggregation parameter
-##'   omega is constant across all observations. If \code{TRUE}, omega varies
-##'   with mean worm burden according to
-##'   \eqn{\log(\omega_i) = \omega_0 + \omega_1 \log(\mu_{W,i})},
-##'   adding one additional parameter \eqn{\omega_1} (the slope). This is
-##'   motivated by the empirical Coffeng relationship observed in survey data.
+##' @param vary_k Logical. STH only — see \code{dsgm()}.
 ##' @param omega1_start Starting value for \eqn{\omega_1} when \code{vary_k = TRUE}.
-##'   Defaults to 0.5 (consistent with the Kenya hookworm data analysis).
-##' @param intensity_family Integer; 0 = shifted Gamma (default), 1 = zero-truncated NegBin.
+##' @param intensity_family Integer; 0 = shifted Gamma, 1 = zero-truncated NegBin (STH only).
+##' @param worm_family Integer; 0 = Negative Binomial, 1 = Poisson (LF only).
+##'   Passed straight through to \code{.dsgm_fit_tmb_lf_mdiag()}; ignored for
+##'   \code{model = "sth"}.
 ##' @keywords internal
 ##' @importFrom TMB MakeADFun sdreport
 ##' @importFrom stats nlminb
@@ -177,6 +174,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
                          which_diag        = NULL,
                          gamma_sens        = 0.97,
                          fix_k             = NULL,
+                         worm_family       = 0L,        # <-- NEW
                          fix_tau2          = NULL,
                          use_mda           = TRUE,
                          intensity_family  = 0L,
@@ -198,6 +196,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
       cov_offset        = cov_offset,
       gamma_sens        = gamma_sens,
       fix_k             = fix_k,
+      worm_family       = worm_family,       # <-- NEW
       fix_tau2          = fix_tau2,
       use_mda           = use_mda,
       int_mat           = int_mat,
@@ -213,12 +212,12 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
   }
 
   # ---------------------------------------------------------------------------
-  # STH branch
+  # STH branch — unchanged, worm_family not applicable
   # ---------------------------------------------------------------------------
   n         <- length(y_prev)
   n_loc     <- nrow(coords)
   S_samples <- S_samples_obj$S_samples
-  pos_idx   <- which(y_prev == 1) - 1L   # 0-indexed
+  pos_idx   <- which(y_prev == 1) - 1L
 
   vary_k_int <- as.integer(vary_k)
 
@@ -251,7 +250,6 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
 
   tmb_penalty <- convert_penalty_to_tmb(penalty)
 
-  # Helper: build TMB data list
   make_data <- function(compute_denom, log_denom_vals) {
     list(
       y_prev                   = y_prev,
@@ -288,7 +286,6 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     )
   }
 
-  # Starting value for omega1: use par0$omega1 if supplied, else omega1_start
   omega1_init <- if (!is.null(par0$omega1)) par0$omega1 else omega1_start
 
   parameters <- list(
@@ -299,12 +296,11 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     log_gamma   = log(par0$gamma_W),
     log_sigma2  = log(par0$sigma2),
     log_phi     = log(par0$phi),
-    omega1      = omega1_init   # slope on log(mu_W); fixed at 0 when vary_k=FALSE
+    omega1      = omega1_init
   )
 
   map_list <- list()
 
-  # Map omega1 to NA (fixed at initial value = 0) when vary_k = FALSE
   if (!vary_k) {
     parameters$omega1 <- 0.0
     map_list$omega1   <- factor(NA)
@@ -325,7 +321,6 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
   }
   tmb_map <- if (length(map_list) > 0) map_list else NULL
 
-  # --- Pass 1: denominator at theta_0 ---
   obj_d <- TMB::MakeADFun(
     data       = make_data(1L, numeric(nrow(S_samples))),
     parameters = parameters,
@@ -336,7 +331,6 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
   obj_d$fn()
   log_denominator_vals <- obj_d$report()$log_f_vals
 
-  # --- Pass 2: MCML objective ---
   if (messages) message("Building TMB objective for optimization...")
   obj <- TMB::MakeADFun(
     data       = make_data(0L, log_denominator_vals),
@@ -346,7 +340,6 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     silent     = !messages
   )
 
-  # --- Sanity check: NLL at theta_0 should equal penalty only ---
   obj_at_par0      <- obj$fn(obj$par)
   expected_penalty <- 0
   if (tmb_penalty$use_alpha_penalty == 1 && tmb_penalty$alpha_penalty_type == 1) {
@@ -396,7 +389,6 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
   sdr     <- TMB::sdreport(obj)
   par_est <- summary(sdr, "report")
 
-  # Extract omega1 from ADREPORT (always present; = 0 with NA SE when fixed)
   omega1_est <- par_est["omega1", "Estimate"]
   omega1_se  <- par_est["omega1", "Std. Error"]
 
@@ -452,7 +444,8 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
 ##' @keywords internal
 .dsgm_fit_tmb_lf_mdiag <- function(y_counts, units_m, which_diag, D, coords,
                                    ID_coords, cov_offset, gamma_sens,
-                                   fix_k, fix_tau2 = NULL, use_mda,
+                                   fix_k, worm_family = 0L,
+                                   fix_tau2 = NULL, use_mda,
                                    int_mat, survey_times_data, mda_times,
                                    fix_alpha_W, fix_gamma_W, penalty,
                                    par0, S_samples_obj, messages) {
@@ -516,8 +509,13 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
     log_phi       = log(par0$phi),
     log_nu2       = log(max(if (!is.null(fix_tau2)) fix_tau2 else par0$tau2,
                             1e-10) / par0$sigma2),
-    log_omega     = log(if (!is.null(fix_k)) fix_k else par0$k),
-    log_alpha     = log(par0$rho),
+    # par0$k may be NULL (worm_family = "poisson", where omega does not
+    # exist) or Inf (returned by a previous Poisson fit). Under Poisson
+    # log_omega is mapped out below and never enters the likelihood, but
+    # MakeADFun still needs a finite starting value.
+    log_omega     = log(if (!is.null(fix_k)) fix_k
+                        else if (!is.null(par0$k) && is.finite(par0$k)) par0$k
+                        else 1.0),    log_alpha     = log(par0$rho),
     logit_alpha_W = if (use_mda) qlogis(par0$alpha_W) else 0.0,
     log_gamma_W   = if (use_mda) log(par0$gamma_W)    else 0.0
   )
