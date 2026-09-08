@@ -101,7 +101,10 @@ distribution differs by sub-model:
     the latter scaled by the fixed sensitivity \code{gamma_sens}. No
     hurdle decomposition applies; CRPS/SCRPS/AnPIT are computed directly
     on this Binomial predictive, exactly as for a \code{glgpm(family =
-    "binomial")} fit.
+    "binomial")} fit. When the fit used
+    \code{worm_family = "poisson"}, the success probabilities are
+    evaluated in the exact \eqn{\omega \to \infty} limit rather than via
+    the Negative Binomial expression (see below).
 }
 Hurdle-decomposition diagnostics (\code{pos_cal}, \code{AnPIT_cond}) are
 therefore only populated for STH fits; LF fits only populate the standard

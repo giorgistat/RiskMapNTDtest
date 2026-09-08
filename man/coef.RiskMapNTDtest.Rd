@@ -2,51 +2,25 @@
 % Please edit documentation in R/auxiliary.R
 \name{coef.RiskMapNTDtest}
 \alias{coef.RiskMapNTDtest}
-\title{Extract Parameter Estimates from a "RiskMapNTDtest" Model Fit}
+\title{Extract Model Coefficients}
 \usage{
 \method{coef}{RiskMapNTDtest}(object, ...)
 }
 \arguments{
-\item{object}{An object of class "RiskMapNTDtest" obtained as a result of a call to \code{\link{glgpm}} or \code{\link{dsgm}}.}
+\item{object}{An object of class \code{"RiskMapNTDtest"}.}
 
-\item{...}{other parameters.}
+\item{...}{other parameters (currently unused).}
 }
 \value{
-A list containing the maximum likelihood estimates. For standard models:
-\item{beta}{A vector of coefficient estimates.}
-\item{sigma2}{The estimate for the variance parameter \eqn{\sigma^2}.}
-\item{phi}{The estimate for the spatial range parameter \eqn{\phi}.}
-\item{tau2}{The estimate for the nugget effect parameter \eqn{\tau^2}, if applicable.}
-\item{sigma2_me}{The estimate for the measurement error variance \eqn{\sigma^2_{me}}, if applicable.}
-\item{sigma2_re}{A vector of variance estimates for the random effects, if applicable.}
-For STH DSGM models (\code{family = "intprev"}):
-\item{beta}{Coefficient estimates for log mean worm burden.}
-\item{k}{Negative binomial overdispersion parameter.}
-\item{rho}{Egg detection rate (fecundity).}
-\item{alpha_W}{Immediate worm burden reduction from MDA (if estimated or fixed).}
-\item{gamma_W}{Decay rate of MDA effect (if estimated or fixed).}
-\item{sigma2}{Spatial process variance.}
-\item{phi}{Spatial correlation scale.}
-For LF DSGM models (\code{family = "lf_mdiag"}):
-\item{beta}{Coefficient estimates for log mean worm burden.}
-\item{k}{Negative binomial overdispersion parameter.}
-\item{rho}{Per-worm MF detection rate.}
-\item{gamma_sens}{Serological test sensitivity (fixed by user).}
-\item{tau2}{Nugget variance (if estimated).}
-\item{alpha_W}{Immediate worm burden reduction from MDA (if used).}
-\item{gamma_W}{Decay rate of MDA effect (if used).}
-\item{sigma2}{Spatial process variance.}
-\item{phi}{Spatial correlation scale.}
+A named list of parameter estimates on the natural (not
+  transformed/link) scale. For DSGM \code{lf_mdiag} fits with
+  \code{worm_family = "poisson"}, the aggregation parameter \code{k} is
+  returned as \code{Inf}, reflecting the absence of a Negative Binomial
+  aggregation parameter in that limit.
 }
 \description{
-This \code{coef} method for the "RiskMapNTDtest" class extracts the
-maximum likelihood estimates from model fits obtained from the \code{\link{glgpm}} or \code{\link{dsgm}} functions.
-}
-\seealso{
-\code{\link{glgpm}}, \code{\link{dsgm}}
-}
-\author{
-Emanuele Giorgi \email{e.giorgi@lancaster.ac.uk}
-
-Claudio Fronterre \email{c.fronterr@lancaster.ac.uk}
+\code{coef} method for objects of class \code{"RiskMapNTDtest"},
+  covering DSGM model fits (\code{family \%in\% c("intprev", "lf_mdiag")}),
+  produced by \code{\link{dsgm}}, as well as standard geostatistical and
+  DAST fits produced by \code{\link{glgpm}}/\code{\link{dast}}.
 }

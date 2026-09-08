@@ -359,7 +359,20 @@ interpret.formula <- function(formula) {
   ret
 }
 
-
+##' @title Extract Model Coefficients
+##' @description \code{coef} method for objects of class \code{"RiskMapNTDtest"},
+##'   covering DSGM model fits (\code{family \%in\% c("intprev", "lf_mdiag")}),
+##'   produced by \code{\link{dsgm}}, as well as standard geostatistical and
+##'   DAST fits produced by \code{\link{glgpm}}/\code{\link{dast}}.
+##' @param object An object of class \code{"RiskMapNTDtest"}.
+##' @param ... other parameters (currently unused).
+##' @return A named list of parameter estimates on the natural (not
+##'   transformed/link) scale. For DSGM \code{lf_mdiag} fits with
+##'   \code{worm_family = "poisson"}, the aggregation parameter \code{k} is
+##'   returned as \code{Inf}, reflecting the absence of a Negative Binomial
+##'   aggregation parameter in that limit.
+##' @method coef RiskMapNTDtest
+##' @export
 coef.RiskMapNTDtest <- function(object, ...) {
 
   `%||%` <- function(a, b) if (!is.null(a)) a else b

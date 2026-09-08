@@ -25,6 +25,7 @@ dsgm_fit_tmb(
   which_diag = NULL,
   gamma_sens = 0.97,
   fix_k = NULL,
+  worm_family = 0L,
   fix_tau2 = NULL,
   use_mda = TRUE,
   intensity_family = 0L,
@@ -35,17 +36,15 @@ dsgm_fit_tmb(
 )
 }
 \arguments{
-\item{intensity_family}{Integer; 0 = shifted Gamma (default), 1 = zero-truncated NegBin.}
+\item{worm_family}{Integer; 0 = Negative Binomial, 1 = Poisson (LF only).
+Passed straight through to \code{.dsgm_fit_tmb_lf_mdiag()}; ignored for
+\code{model = "sth"}.}
 
-\item{vary_k}{Logical. If \code{FALSE} (default), the aggregation parameter
-omega is constant across all observations. If \code{TRUE}, omega varies
-with mean worm burden according to
-\eqn{\log(\omega_i) = \omega_0 + \omega_1 \log(\mu_{W,i})},
-adding one additional parameter \eqn{\omega_1} (the slope). This is
-motivated by the empirical Coffeng relationship observed in survey data.}
+\item{intensity_family}{Integer; 0 = shifted Gamma, 1 = zero-truncated NegBin (STH only).}
 
-\item{omega1_start}{Starting value for \eqn{\omega_1} when \code{vary_k = TRUE}.
-Defaults to 0.5 (consistent with the Kenya hookworm data analysis).}
+\item{vary_k}{Logical. STH only — see \code{dsgm()}.}
+
+\item{omega1_start}{Starting value for \eqn{\omega_1} when \code{vary_k = TRUE}.}
 }
 \description{
 MCML estimation using TMB for automatic differentiation.

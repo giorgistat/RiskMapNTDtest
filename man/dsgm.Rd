@@ -9,6 +9,7 @@ dsgm(
   data,
   model = c("sth", "lf_mdiag"),
   intensity_family = c("gamma", "negbin"),
+  worm_family = c("negbin", "poisson"),
   time = NULL,
   mda_times = NULL,
   int_mat = NULL,
@@ -40,6 +41,14 @@ dsgm(
 \arguments{
 \item{intensity_family}{Distribution for C | C > 0 (STH model only).
 \code{"gamma"} (default) = shifted Gamma; \code{"negbin"} = zero-truncated NegBin.}
+
+\item{worm_family}{Distribution for the latent worm burden (LF model only).
+\code{"negbin"} (default) = Negative Binomial, with aggregation parameter
+\eqn{\omega} estimated (or fixed via \code{fix_k}). \code{"poisson"} = the
+\eqn{\omega \to \infty} limit, evaluated exactly (not via a large fixed
+\code{fix_k}, which is numerically unstable). \eqn{\omega} is inactive
+and not estimated in this case. Ignored with a warning if \code{model !=
+"lf_mdiag"}.}
 
 \item{vary_k}{Logical (STH model only). If \code{FALSE} (default), the
 NegBin aggregation parameter \eqn{\omega} is constant across all
