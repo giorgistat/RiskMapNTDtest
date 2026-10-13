@@ -431,7 +431,9 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
     if (is.null(fix_alpha_W)) { alpha_W <- plogis(par[idx]); idx <- idx + 1 } else alpha_W <- fix_alpha_W
     if (is.null(fix_gamma_W)) { gamma_W <- exp(par[idx]);    idx <- idx + 1 } else gamma_W <- fix_gamma_W
     # omega1 slope (only estimated when vary_k = TRUE)
-    omega1  <- if (vary_k) par[idx] else 0.0
+    # omega1 is held at its starting value: without S, mu_W varies only through
+    # the MDA effect, so log_k and omega1 lie on a ridge and both diverge.
+    omega1  <- if (vary_k) o1_0 else 0.0
 
     mu_star <- exp(D %*% beta) *
       compute_mda_effect(st_u, mda_times, im_u,
@@ -495,14 +497,22 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
   par0 <- c(b0, log(k0), log(rho0))
   if (is.null(fix_alpha_W)) par0 <- c(par0, qlogis(aW0))
   if (is.null(fix_gamma_W)) par0 <- c(par0, log(gW0))
-  if (vary_k)               par0 <- c(par0, o1_0)
+
+  # Box constraints keep weakly identified directions (alpha_W -> 0 makes
+  # gamma_W free) at plausible values instead of drifting to +/- infinity.
+  lo <- c(rep(-Inf, p), log(1e-3), log(1e-3))
+  up <- c(rep( Inf, p), log(1e3),  log(1e2))
+  if (is.null(fix_alpha_W)) { lo <- c(lo, qlogis(0.01)); up <- c(up, qlogis(0.99)) }
+  if (is.null(fix_gamma_W)) { lo <- c(lo, log(0.1));     up <- c(up, log(50)) }
+  par0 <- pmin(pmax(par0, lo + 1e-8), up - 1e-8)
 
   if (messages) message("Optimising simplified model for initial values (STH)...")
   if (nll(par0) >= 1e10)
     warning("STH initial-value objective is not finite at the starting values; ",
             "the optimiser cannot move. Supply 'par0' or 'start_pars'.")
-  fit <- nlminb(par0, nll, control = list(eval.max = 2000, iter.max = 1000,
-                                          trace = ifelse(messages, 1, 0)))
+  fit <- nlminb(par0, nll, lower = lo, upper = up,
+                control = list(eval.max = 2000, iter.max = 1000,
+                               trace = ifelse(messages, 1, 0)))
   pe <- if (fit$convergence != 0 || fit$objective >= 1e10) {
     warning("STH initial value optimisation did not converge (code=",
             fit$convergence, "). Using starting values.")
@@ -516,7 +526,7 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
   idx <- p + 3
   aW_e <- if (is.null(fix_alpha_W)) { v <- plogis(pe[idx]); idx <- idx + 1; v } else fix_alpha_W
   gW_e <- if (is.null(fix_gamma_W))   { v <- exp(pe[idx]);   idx <- idx + 1; v } else fix_gamma_W
-  o1_e <- if (vary_k) pe[idx] else 0.0
+  o1_e <- if (vary_k) o1_0 else 0.0
 
   s2_0  <- if (!is.null(start_pars$sigma2)) start_pars$sigma2 else 1.0
   phi_0 <- if (!is.null(start_pars$phi)) start_pars$phi else {
