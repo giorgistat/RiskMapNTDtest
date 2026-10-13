@@ -29,6 +29,20 @@
 // Inference: MCML with importance sampling.
 //   Step 1: compute_denominator_only = 1  -> report log_f_vals at theta_0
 //   Step 2: compute_denominator_only = 0  -> MCML objective
+//
+// Memory design (tape size of the MCML objective):
+//   * R^{-1} and log|R| via atomic::matinvpd, and all quadratic forms
+//     S_s' R^{-1} S_s via one atomic::matmul, as in inst/tmb/dsgm_mdiag.cpp.
+//     The previous AD Cholesky plus per-sample triangular solves cost
+//     O(n_loc^3 + n_samples * n_loc^2) taped operations.
+//   * Observations are collapsed into groups that share mu_W (same location,
+//     survey time, covariates, offset and MDA history; see
+//     R/sth_obs_groups.R). Prevalence and intensity terms are summed exactly
+//     per group, so the Monte Carlo loop costs O(G + n_pos) per sample instead
+//     of O(n). Only the NegBin term lgamma(c + phi_C) remains per positive,
+//     and only for c = C - 1 != 0.
+//   The objective is identical to the ungrouped dense-Cholesky version up to
+//   floating-point summation order.
 // =============================================================================
 
 template<class Type>
@@ -47,8 +61,6 @@ Type objective_function<Type>::operator() ()
   // ===========================================================================
 
   DATA_VECTOR(y_prev);
-  DATA_VECTOR(intensity_data);
-  DATA_IVECTOR(pos_idx);
 
   DATA_MATRIX(D);
   DATA_VECTOR(cov_offset);
@@ -66,6 +78,20 @@ Type objective_function<Type>::operator() ()
   DATA_IVECTOR(mda_j);
   DATA_VECTOR(mda_coverage);
   DATA_INTEGER(n_mda_pairs);
+
+  // Observation groups (built by .sth_obs_groups() in R)
+  DATA_IVECTOR(grp_rep);       // representative observation of each group (0-based)
+  DATA_VECTOR(grp_npos);       // number of egg-positives per group
+  DATA_VECTOR(grp_nneg);       // number of egg-negatives per group
+  DATA_IVECTOR(pgrp);          // groups holding at least one positive (0-based)
+  DATA_VECTOR(pgrp_n);         // positives per positive-group
+  DATA_VECTOR(pgrp_nlg);       // positives with C - 1 != 0 per positive-group
+  DATA_VECTOR(pgrp_sumc);      // sum of (C - 1)
+  DATA_VECTOR(pgrp_const);     // -sum lgamma(C)            [NegBin constant]
+  DATA_VECTOR(pgrp_sumy);      // sum of max(C - 1, 0)      [Gamma]
+  DATA_VECTOR(pgrp_sumlogy);   // sum of log(max(C-1,0)+1e-10) [Gamma]
+  DATA_VECTOR(lg_c);           // C - 1 for positives with C - 1 != 0
+  DATA_IVECTOR(lg_pg);         // their positive-group index (0-based)
 
   // Alpha penalty
   DATA_INTEGER(use_alpha_penalty);
@@ -116,8 +142,10 @@ Type objective_function<Type>::operator() ()
   const Type phi     = exp(log_phi);
 
   int n         = y_prev.size();
-  int n_pos     = intensity_data.size();
   int n_samples = S_samples.rows();
+  int G         = grp_rep.size();
+  int Gp        = pgrp.size();
+  int n_lg      = lg_c.size();
 
   // ===========================================================================
   // MDA EFFECT
@@ -136,7 +164,7 @@ Type objective_function<Type>::operator() ()
   }
 
   // ===========================================================================
-  // CORRELATION MATRIX AND CHOLESKY
+  // CORRELATION MATRIX R, INVERSE AND LOG-DETERMINANT
   // ===========================================================================
 
   matrix<Type> R(n_loc, n_loc);
@@ -149,118 +177,129 @@ Type objective_function<Type>::operator() ()
     }
   }
 
-  Eigen::LLT<Eigen::Matrix<Type, Eigen::Dynamic, Eigen::Dynamic>> llt(R);
-  matrix<Type> L = llt.matrixL();
-
-  Type log_det_R = Type(0.0);
-  for (int i = 0; i < n_loc; i++) log_det_R += log(L(i, i));
-  log_det_R *= Type(2.0);
+  Type log_det_R;
+  matrix<Type> Rinv = atomic::matinvpd(R, log_det_R);
 
   // ===========================================================================
-  // FIXED-EFFECTS LINEAR PREDICTOR
+  // BATCHED QUADRATIC FORMS   quad(s) = S_s' R^{-1} S_s
+  // ===========================================================================
+
+  matrix<Type> St = S_samples.transpose();      // n_loc x n_samples
+  matrix<Type> M  = atomic::matmul(Rinv, St);   // n_loc x n_samples, one node
+
+  vector<Type> quad(n_samples);
+  for (int s = 0; s < n_samples; s++) {
+    Type q = Type(0.0);
+    for (int i = 0; i < n_loc; i++) q += St(i, s) * M(i, s);
+    quad(s) = q;
+  }
+
+  const Type log_prior_const = Type(n_loc) * log(sigma2) + log_det_R;
+
+  // ===========================================================================
+  // FIXED-EFFECTS LINEAR PREDICTOR (group representatives only)
   // ===========================================================================
 
   vector<Type> mu_fixed = D * beta + cov_offset;
   const Type   c_rho    = Type(1.0) - exp(-rho);
+
+  vector<Type> eta_g(G);   // fixed-effects predictor, per group
+  vector<Type> mda_g(G);   // MDA effect, per group
+  vector<int>  loc_g(G);
+  for (int g = 0; g < G; g++) {
+    int i    = grp_rep(g);
+    eta_g(g) = mu_fixed(i);
+    mda_g(g) = mda_effect(i);
+    loc_g(g) = ID_coords(i);
+  }
 
   // ===========================================================================
   // MONTE CARLO LOOP
   // ===========================================================================
 
   vector<Type> log_f_vals(n_samples);
+  vector<Type> mu_g(G), k_g(G), praw_g(G);
+  vector<Type> phiC_h(Gp);
 
   for (int s = 0; s < n_samples; s++) {
 
-    vector<Type> S_s = S_samples.row(s);
-
-    vector<Type> mu_W(n);
-    for (int i = 0; i < n; i++)
-      mu_W(i) = exp(mu_fixed(i) + S_s(ID_coords(i))) * mda_effect(i);
-
-    // ----- Prevalence likelihood -----
     Type ll = Type(0.0);
 
-    for (int i = 0; i < n; i++) {
-      Type k_i = (vary_k == 1) ?
-      exp(log_k + omega1 * log(mu_W(i) + Type(1e-10))) : k;
+    // ----- Prevalence likelihood (per group) -----
+    for (int g = 0; g < G; g++) {
+      Type mu_W = exp(eta_g(g) + S_samples(s, loc_g(g))) * mda_g(g);
+      Type k_i  = (vary_k == 1) ?
+        exp(log_k + omega1 * log(mu_W + Type(1e-10))) : k;
 
-      Type ratio = k_i / (k_i + mu_W(i) * c_rho);
-      Type pr    = Type(1.0) - pow(ratio, k_i);
-      pr = CppAD::CondExpLt(pr, Type(1e-10),             Type(1e-10),             pr);
-      pr = CppAD::CondExpGt(pr, Type(1.0) - Type(1e-10), Type(1.0) - Type(1e-10), pr);
+      Type ratio = k_i / (k_i + mu_W * c_rho);
+      Type pr_r  = Type(1.0) - pow(ratio, k_i);
+      mu_g(g) = mu_W; k_g(g) = k_i; praw_g(g) = pr_r;
 
-      if (y_prev(i) > Type(0.5))
-        ll += log(pr);
-      else
-        ll += log(Type(1.0) - pr);
+      Type pr = CppAD::CondExpLt(pr_r, Type(1e-10),             Type(1e-10),             pr_r);
+      pr      = CppAD::CondExpGt(pr,   Type(1.0) - Type(1e-10), Type(1.0) - Type(1e-10), pr);
+
+      if (grp_npos(g) > Type(0.5)) ll += grp_npos(g) * log(pr);
+      if (grp_nneg(g) > Type(0.5)) ll += grp_nneg(g) * log(Type(1.0) - pr);
     }
 
-    // ----- Intensity likelihood (positives only) -----
-    for (int idx = 0; idx < n_pos; idx++) {
-      int  i    = pos_idx(idx);
-      Type mu_i = mu_W(i);
-      Type k_i  = (vary_k == 1) ?
-      exp(log_k + omega1 * log(mu_i + Type(1e-10))) : k;
-
-      Type ratio = k_i / (k_i + mu_i * c_rho);
-      Type pr_i  = Type(1.0) - pow(ratio, k_i);
-      pr_i = CppAD::CondExpLt(pr_i, Type(1e-10), Type(1e-10), pr_i);
+    // ----- Intensity likelihood (per positive-group) -----
+    for (int h = 0; h < Gp; h++) {
+      int  g    = pgrp(h);
+      Type mu_i = mu_g(g);
+      Type k_i  = k_g(g);
+      Type pr_i = CppAD::CondExpLt(praw_g(g), Type(1e-10), Type(1e-10), praw_g(g));
 
       Type mu_C     = (rho * mu_i) / pr_i;
       Type sigma2_C = (rho * mu_i * (Type(1.0) + rho)) / pr_i
-      + (rho * rho * mu_i * mu_i / pr_i)
+        + (rho * rho * mu_i * mu_i / pr_i)
         * (Type(1.0)/k_i + Type(1.0) - Type(1.0)/pr_i);
-        sigma2_C = CppAD::CondExpLt(sigma2_C, Type(1e-6), Type(1e-6), sigma2_C);
+      sigma2_C = CppAD::CondExpLt(sigma2_C, Type(1e-6), Type(1e-6), sigma2_C);
 
-        if (intensity_family == 0) {
+      if (intensity_family == 0) {
 
-          // Shifted Gamma: C - 1 ~ Gamma(kappa_C, theta_C)
-          Type mu_C1 = mu_C - Type(1.0);
-          mu_C1 = CppAD::CondExpLt(mu_C1, Type(0.1), Type(0.1), mu_C1);
+        // Shifted Gamma: C - 1 ~ Gamma(kappa_C, theta_C), summed over the group
+        Type mu_C1 = mu_C - Type(1.0);
+        mu_C1 = CppAD::CondExpLt(mu_C1, Type(0.1), Type(0.1), mu_C1);
 
-          Type kappa_C = (mu_C1 * mu_C1) / sigma2_C;
-          Type theta_C = sigma2_C / mu_C1;
-          kappa_C = CppAD::CondExpLt(kappa_C, Type(1e-6), Type(1e-6), kappa_C);
-          theta_C = CppAD::CondExpLt(theta_C, Type(1e-6), Type(1e-6), theta_C);
+        Type kappa_C = (mu_C1 * mu_C1) / sigma2_C;
+        Type theta_C = sigma2_C / mu_C1;
+        kappa_C = CppAD::CondExpLt(kappa_C, Type(1e-6), Type(1e-6), kappa_C);
+        theta_C = CppAD::CondExpLt(theta_C, Type(1e-6), Type(1e-6), theta_C);
 
-          Type y_shift = intensity_data(idx) - Type(1.0);
-          y_shift = CppAD::CondExpLt(y_shift, Type(0.0), Type(0.0), y_shift);
+        ll += (kappa_C - Type(1.0)) * pgrp_sumlogy(h)
+          - pgrp_sumy(h) / theta_C
+          - pgrp_n(h) * (kappa_C * log(theta_C) + lgamma(kappa_C));
 
-          ll += (kappa_C - Type(1.0)) * log(y_shift + Type(1e-10))
-            - y_shift / theta_C
-          - kappa_C * log(theta_C)
-          - lgamma(kappa_C);
+      } else {
 
-        } else {
+        // Shifted NegBin2: C - 1 ~ NB2(mu_C1, phi_C), group-level terms
+        Type mu_C1 = mu_C - Type(1.0);
+        mu_C1 = CppAD::CondExpLt(mu_C1, Type(0.1), Type(0.1), mu_C1);
 
-          // Shifted NegBin2: C - 1 ~ NB2(mu_C1, phi_C)
-          // Moments of C - 1: mean = mu_C - 1, variance = sigma2_C
-          Type mu_C1 = mu_C - Type(1.0);
-          mu_C1 = CppAD::CondExpLt(mu_C1, Type(0.1), Type(0.1), mu_C1);
+        Type denom_nb = sigma2_C - mu_C1;
+        denom_nb = CppAD::CondExpLt(denom_nb, Type(1e-6), Type(1e-6), denom_nb);
+        Type phi_C = mu_C1 * mu_C1 / denom_nb;
+        phi_C = CppAD::CondExpLt(phi_C, Type(1e-4), Type(1e-4), phi_C);
+        phiC_h(h) = phi_C;
 
-          Type denom_nb = sigma2_C - mu_C1;
-          denom_nb = CppAD::CondExpLt(denom_nb, Type(1e-6), Type(1e-6), denom_nb);
-          Type phi_C = mu_C1 * mu_C1 / denom_nb;
-          phi_C = CppAD::CondExpLt(phi_C, Type(1e-4), Type(1e-4), phi_C);
+        Type log_r   = log(phi_C) - log(phi_C + mu_C1);
+        Type log_1mr = log(mu_C1) - log(phi_C + mu_C1);
 
-          Type c_shift = intensity_data(idx) - Type(1.0);   // C - 1 >= 0
-          Type log_r   = log(phi_C)  - log(phi_C + mu_C1);
-          Type log_1mr = log(mu_C1)  - log(phi_C + mu_C1);
-
-          ll += lgamma(c_shift + phi_C) - lgamma(phi_C) - lgamma(c_shift + Type(1.0))
-            + phi_C * log_r + c_shift * log_1mr;
-        }
+        ll += - pgrp_nlg(h) * lgamma(phi_C)
+          + pgrp_n(h) * phi_C * log_r
+          + pgrp_sumc(h) * log_1mr
+          + pgrp_const(h);
+      }
     }
 
-    // ----- GP prior -----
-    Eigen::Matrix<Type, Eigen::Dynamic, 1> S_eig = S_s;
-    Eigen::Matrix<Type, Eigen::Dynamic, 1> z =
-      L.template triangularView<Eigen::Lower>().solve(S_eig);
-    vector<Type> z_v = z;
-    Type quad = (z_v * z_v).sum();
+    // ----- NegBin per-positive term lgamma(c + phi_C), c = C - 1 != 0 -----
+    if (intensity_family != 0) {
+      for (int j = 0; j < n_lg; j++)
+        ll += lgamma(lg_c(j) + phiC_h(lg_pg(j)));
+    }
 
-    Type log_prior = -Type(0.5) * (Type(n_loc) * log(sigma2) + log_det_R +
-      quad / sigma2);
+    // ----- GP prior (quad(s) precomputed above) -----
+    Type log_prior = -Type(0.5) * (log_prior_const + quad(s) / sigma2);
 
     Type log_num  = ll + log_prior;
     log_f_vals(s) = compute_denominator_only ?

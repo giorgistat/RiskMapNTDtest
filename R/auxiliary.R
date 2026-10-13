@@ -981,7 +981,7 @@ print.summary.RiskMapNTDtest <- function(x, ...) {
       cat(sprintf("Latent worm burden: %s\n", worm_label))
       # Show intensity likelihood family
       fam_label <- if (identical(x$intensity_family, "negbin"))
-        "zero-truncated Negative Binomial (moment-matched)"
+        "shifted Negative Binomial, C - 1 ~ NB2 (moment-matched)"
       else
         "shifted Gamma (moment-matched)"
       cat(sprintf("Intensity likelihood C | C > 0: %s\n\n", fam_label))
