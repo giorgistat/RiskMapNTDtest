@@ -160,7 +160,7 @@ get_stan_model <- function(model = c("sth", "lf"), backend = NULL,
 # =============================================================================
 
 ##' @title Sample spatial process for the STH model
-##' @param intensity_family Integer; 0 = shifted Gamma (default), 1 = zero-truncated NegBin.
+##' @param intensity_family Integer; 0 = shifted Gamma (default), 1 = shifted NegBin2 (C - 1 ~ NB2).
 ##' @keywords internal
 sample_spatial_process_stan <- function(y_prev,
                                         intensity_data,
@@ -216,7 +216,7 @@ sample_spatial_process_stan <- function(y_prev,
   if (messages)
     message(sprintf("Sampling %d iter (%d warmup), %d chain(s) [sth, family=%s]...",
                     n_samples + n_warmup, n_warmup, n_chains,
-                    ifelse(intensity_family == 0L, "shifted Gamma", "zero-trunc NegBin")))
+                    ifelse(intensity_family == 0L, "shifted Gamma", "shifted NegBin2")))
 
   fit       <- .run_stan(mod$model, backend, stan_data,
                          n_samples, n_warmup, n_chains, n_cores,
@@ -356,6 +356,7 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
                                int_mat, survey_times_data, mda_times,
                                penalty, fix_alpha_W, fix_gamma_W,
                                vary_k = FALSE, omega1_start = 0.5,
+                               intensity_family = 0L,
                                start_pars, messages) {
 
   n <- length(y_prev)
@@ -408,20 +409,33 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
   }
 
 
+  # The MDA effect depends only on (survey time, MDA history), so evaluate the
+  # slow R-level compute_mda_effect() once per unique combination (exact).
+  mda_key <- do.call(paste, c(list(sprintf("%a", as.numeric(survey_times_data))),
+                              lapply(seq_len(ncol(int_mat)),
+                                     function(j) sprintf("%a", as.numeric(int_mat[, j]))),
+                              sep = "|"))
+  mda_first <- !duplicated(mda_key)
+  mda_map   <- match(mda_key, mda_key[mda_first])
+  st_u      <- survey_times_data[mda_first]
+  im_u      <- int_mat[mda_first, , drop = FALSE]
+
   nll <- function(par) {
     beta    <- par[1:p]
     k       <- exp(par[p + 1])
     rho     <- exp(par[p + 2])
     idx     <- p + 3
-    alpha_W <- if (is.null(fix_alpha_W)) { v <- plogis(par[idx]); idx <<- idx + 1; v } else fix_alpha_W
-    gamma_W <- if (is.null(fix_gamma_W))   exp(par[idx])                               else fix_gamma_W
-    idx     <- idx + as.integer(is.null(fix_gamma_W))
+    # NB: plain local assignment. The previous `idx <<- idx + 1` wrote to the
+    # global environment, so gamma_W was read from the alpha_W slot and omega1
+    # from the gamma_W slot whenever alpha_W was estimated.
+    if (is.null(fix_alpha_W)) { alpha_W <- plogis(par[idx]); idx <- idx + 1 } else alpha_W <- fix_alpha_W
+    if (is.null(fix_gamma_W)) { gamma_W <- exp(par[idx]);    idx <- idx + 1 } else gamma_W <- fix_gamma_W
     # omega1 slope (only estimated when vary_k = TRUE)
     omega1  <- if (vary_k) par[idx] else 0.0
 
     mu_star <- exp(D %*% beta) *
-      compute_mda_effect(survey_times_data, mda_times, int_mat,
-                         alpha_W, gamma_W, kappa = 1)
+      compute_mda_effect(st_u, mda_times, im_u,
+                         alpha_W, gamma_W, kappa = 1)[mda_map]
 
     # Per-observation k when vary_k = TRUE
     k_vec <- if (vary_k) {
@@ -436,15 +450,30 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
     ll <- sum(log(1 - pr[y_prev == 0])) + sum(log(pr[y_prev == 1]))
 
     pos    <- which(y_prev == 1)
-    mu_pos <- mu_star[pos]; k_pos <- k_vec[pos]; pr_pos <- pr[pos]
+    mu_pos <- mu_star[pos]; k_pos <- k_vec[pos]
+    # intensity terms mirror src/dsgm_tmb.cpp exactly (same clamps)
+    pr_pos <- pmax(1 - (k_pos / (k_pos + mu_pos * c_rho))^k_pos, 1e-10)
 
-    mu_C <- rho * mu_pos / pr_pos
-    s2_C <- pmax((rho * mu_pos * (1 + rho)) / pr_pos +
-                   (rho^2 * mu_pos^2 / pr_pos) * (1 / k_pos + 1 - 1 / pr_pos), 1e-10)
-    kC   <- pmax((mu_C - 1)^2 / s2_C, 1e-10)
-    tC   <- pmax(s2_C / (mu_C - 1), 1e-10)
-    li   <- dgamma(intensity_data - 1, shape = kC, scale = tC, log = TRUE)
-    li[!is.finite(li)] <- -1e10
+    mu_C  <- rho * mu_pos / pr_pos
+    s2_C  <- pmax((rho * mu_pos * (1 + rho)) / pr_pos +
+                    (rho^2 * mu_pos^2 / pr_pos) * (1 / k_pos + 1 - 1 / pr_pos), 1e-6)
+    mu_C1 <- pmax(mu_C - 1, 0.1)
+
+    if (intensity_family == 0L) {
+      # Shifted Gamma: C - 1 ~ Gamma. The old dgamma() call returned +/-Inf
+      # whenever C = 1 (C - 1 = 0), which was then set to -1e10 and made the
+      # whole objective flat at 1e10.
+      kC <- pmax(mu_C1^2 / s2_C, 1e-6)
+      tC <- pmax(s2_C / mu_C1,   1e-6)
+      ys <- pmax(intensity_data - 1, 0)
+      li <- (kC - 1) * log(ys + 1e-10) - ys / tC - kC * log(tC) - lgamma(kC)
+    } else {
+      # Shifted NegBin2: C - 1 ~ NB2(mu_C1, phi_C)
+      phiC <- pmax(mu_C1^2 / pmax(s2_C - mu_C1, 1e-6), 1e-4)
+      cs   <- intensity_data - 1
+      li   <- lgamma(cs + phiC) - lgamma(phiC) - lgamma(cs + 1) +
+        phiC * (log(phiC) - log(phiC + mu_C1)) + cs * (log(mu_C1) - log(phiC + mu_C1))
+    }
     ll <- ll + sum(li)
 
     nll <- -(ll - .pen(alpha_W, gamma_W, rho))
@@ -469,9 +498,12 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
   if (vary_k)               par0 <- c(par0, o1_0)
 
   if (messages) message("Optimising simplified model for initial values (STH)...")
+  if (nll(par0) >= 1e10)
+    warning("STH initial-value objective is not finite at the starting values; ",
+            "the optimiser cannot move. Supply 'par0' or 'start_pars'.")
   fit <- nlminb(par0, nll, control = list(eval.max = 2000, iter.max = 1000,
                                           trace = ifelse(messages, 1, 0)))
-  pe <- if (fit$convergence != 0) {
+  pe <- if (fit$convergence != 0 || fit$objective >= 1e10) {
     warning("STH initial value optimisation did not converge (code=",
             fit$convergence, "). Using starting values.")
     par0
@@ -514,7 +546,7 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
 ##' @param omega1_start Starting value for \eqn{\omega_1} when \code{vary_k = TRUE}.
 ##'   Default is 0.5, consistent with estimates from Kenya hookworm survey data.
 ##' @param intensity_family Distribution for C | C > 0 (STH model only).
-##'   \code{"gamma"} (default) = shifted Gamma; \code{"negbin"} = zero-truncated NegBin.
+##'   \code{"gamma"} (default) = shifted Gamma; \code{"negbin"} = shifted NegBin2 (C - 1 ~ NB2).
 ##' @param worm_family Distribution for the latent worm burden (LF model only).
 ##'   \code{"negbin"} (default) = Negative Binomial, with aggregation parameter
 ##'   \eqn{\omega} estimated (or fixed via \code{fix_k}). \code{"poisson"} = the
@@ -707,6 +739,7 @@ dsgm <- function(formula,
         fix_gamma_W       = fix_gamma_W,
         vary_k            = vary_k,
         omega1_start      = omega1_start,
+        intensity_family  = intensity_family_int,
         start_pars        = start_pars,
         messages          = messages)
     }
@@ -976,7 +1009,7 @@ dsgm <- function(formula,
 ##'   the per-observation aggregation parameter is computed as
 ##'   exp(log_k + omega1 * log(mu_W[i])). Must match the vary_k setting used
 ##'   in dsgm_fit_tmb().
-##' @param intensity_family Integer; 0 = shifted Gamma (default), 1 = zero-truncated NegBin.
+##' @param intensity_family Integer; 0 = shifted Gamma (default), 1 = shifted NegBin2 (C - 1 ~ NB2).
 ##' @keywords internal
 sample_spatial_process_stan <- function(y_prev,
                                         intensity_data,
@@ -1042,7 +1075,7 @@ sample_spatial_process_stan <- function(y_prev,
     message(sprintf(
       "Sampling %d iter (%d warmup), %d chain(s) [sth, family=%s, vary_k=%s]...",
       n_samples + n_warmup, n_warmup, n_chains,
-      ifelse(intensity_family == 0L, "shifted Gamma", "zero-trunc NegBin"),
+      ifelse(intensity_family == 0L, "shifted Gamma", "shifted NegBin2"),
       ifelse(vary_k, "TRUE", "FALSE")))
 
   fit       <- .run_stan(mod$model, backend, stan_data,

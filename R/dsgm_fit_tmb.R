@@ -147,7 +147,7 @@ convert_penalty_to_tmb <- function(penalty) {
 ##'
 ##' @param vary_k Logical. STH only — see \code{dsgm()}.
 ##' @param omega1_start Starting value for \eqn{\omega_1} when \code{vary_k = TRUE}.
-##' @param intensity_family Integer; 0 = shifted Gamma, 1 = zero-truncated NegBin (STH only).
+##' @param intensity_family Integer; 0 = shifted Gamma, 1 = shifted NegBin2 (C - 1 ~ NB2) (STH only).
 ##' @param worm_family Integer; 0 = Negative Binomial, 1 = Poisson (LF only).
 ##'   Passed straight through to \code{.dsgm_fit_tmb_lf_mdiag()}; ignored for
 ##'   \code{model = "sth"}.
@@ -250,8 +250,22 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
 
   tmb_penalty <- convert_penalty_to_tmb(penalty)
 
+  # Collapse observations sharing mu_W (same location, survey time, covariates,
+  # offset and MDA history); exact, see R/sth_obs_groups.R
+  grp_data <- .sth_obs_groups(y_prev         = y_prev,
+                              intensity_data = intensity_data,
+                              D              = D,
+                              cov_offset     = cov_offset,
+                              ID_coords      = ID_coords - 1L,
+                              survey_times   = survey_times_data,
+                              int_mat        = int_mat)
+  if (messages)
+    message(sprintf("  Observation groups: %d observations -> %d groups (%d with positives)",
+                    n, grp_data$n_groups, length(grp_data$pgrp)))
+  grp_data$n_groups <- NULL
+
   make_data <- function(compute_denom, log_denom_vals) {
-    list(
+    c(grp_data, list(
       y_prev                   = y_prev,
       intensity_data           = intensity_data,
       pos_idx                  = pos_idx,
@@ -283,7 +297,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
       log_denominator_vals     = log_denom_vals,
       intensity_family         = as.integer(intensity_family),
       vary_k                   = vary_k_int
-    )
+    ))
   }
 
   omega1_init <- if (!is.null(par0$omega1)) par0$omega1 else omega1_start
