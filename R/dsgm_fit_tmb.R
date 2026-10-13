@@ -330,6 +330,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
   )
   obj_d$fn()
   log_denominator_vals <- obj_d$report()$log_f_vals
+  rm(obj_d); gc()   # release the denominator tape before building the main objective
 
   if (messages) message("Building TMB objective for optimization...")
   obj <- TMB::MakeADFun(

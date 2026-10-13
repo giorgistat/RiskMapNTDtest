@@ -136,8 +136,13 @@ Type objective_function<Type>::operator() ()
   }
 
   // ===========================================================================
-  // CORRELATION MATRIX AND CHOLESKY
+  // CORRELATION MATRIX R, INVERSE AND LOG-DETERMINANT
   // ===========================================================================
+  // atomic::matinvpd() returns R^{-1} and log|R| as a single tape node with an
+  // analytic reverse rule. The previous version formed an Eigen::LLT of R in AD
+  // arithmetic (O(n_loc^3) taped operations) and then ran one triangular solve
+  // per Monte Carlo sample (O(n_samples * n_loc^2)), which exhausted memory at
+  // n_loc ~ 1400 with n_samples = 1000. Same fix as inst/tmb/dsgm_mdiag.cpp.
 
   matrix<Type> R(n_loc, n_loc);
   for (int i = 0; i < n_loc; i++) {
@@ -149,12 +154,24 @@ Type objective_function<Type>::operator() ()
     }
   }
 
-  Eigen::LLT<Eigen::Matrix<Type, Eigen::Dynamic, Eigen::Dynamic>> llt(R);
-  matrix<Type> L = llt.matrixL();
+  Type log_det_R;
+  matrix<Type> Rinv = atomic::matinvpd(R, log_det_R);
 
-  Type log_det_R = Type(0.0);
-  for (int i = 0; i < n_loc; i++) log_det_R += log(L(i, i));
-  log_det_R *= Type(2.0);
+  // ===========================================================================
+  // BATCHED QUADRATIC FORMS   quad(s) = S_s' R^{-1} S_s
+  // ===========================================================================
+
+  matrix<Type> St = S_samples.transpose();      // n_loc x n_samples
+  matrix<Type> M  = atomic::matmul(Rinv, St);   // n_loc x n_samples, one node
+
+  vector<Type> quad(n_samples);
+  for (int s = 0; s < n_samples; s++) {
+    Type q = Type(0.0);
+    for (int i = 0; i < n_loc; i++) q += St(i, s) * M(i, s);
+    quad(s) = q;
+  }
+
+  const Type log_prior_const = Type(n_loc) * log(sigma2) + log_det_R;
 
   // ===========================================================================
   // FIXED-EFFECTS LINEAR PREDICTOR
@@ -252,15 +269,8 @@ Type objective_function<Type>::operator() ()
         }
     }
 
-    // ----- GP prior -----
-    Eigen::Matrix<Type, Eigen::Dynamic, 1> S_eig = S_s;
-    Eigen::Matrix<Type, Eigen::Dynamic, 1> z =
-      L.template triangularView<Eigen::Lower>().solve(S_eig);
-    vector<Type> z_v = z;
-    Type quad = (z_v * z_v).sum();
-
-    Type log_prior = -Type(0.5) * (Type(n_loc) * log(sigma2) + log_det_R +
-      quad / sigma2);
+    // ----- GP prior (quad(s) precomputed above) -----
+    Type log_prior = -Type(0.5) * (log_prior_const + quad(s) / sigma2);
 
     Type log_num  = ll + log_prior;
     log_f_vals(s) = compute_denominator_only ?
