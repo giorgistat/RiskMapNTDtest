@@ -159,78 +159,6 @@ get_stan_model <- function(model = c("sth", "lf"), backend = NULL,
 # Stan samplers
 # =============================================================================
 
-##' @title Sample spatial process for the STH model
-##' @param intensity_family Integer; 0 = shifted Gamma (default), 1 = shifted NegBin2 (C - 1 ~ NB2).
-##' @keywords internal
-sample_spatial_process_stan <- function(y_prev,
-                                        intensity_data,
-                                        D,
-                                        coords,
-                                        ID_coords,
-                                        int_mat,
-                                        survey_times_data,
-                                        mda_times,
-                                        par,
-                                        n_samples        = 1000,
-                                        n_warmup         = 1000,
-                                        n_chains         = 4,
-                                        n_cores          = 4,
-                                        adapt_delta      = 0.8,
-                                        max_treedepth    = 10,
-                                        intensity_family = 0L,
-                                        backend          = NULL,
-                                        messages         = TRUE) {
-
-  n       <- length(y_prev)
-  n_loc   <- nrow(coords)
-  p       <- ncol(D)
-  pos_idx <- which(y_prev == 1)
-  n_pos   <- length(pos_idx)
-
-  mda_impact <- compute_mda_effect(survey_times_data, mda_times, int_mat,
-                                   par$alpha_W, par$gamma_W, kappa = 1)
-
-  stan_data <- list(
-    n                = n,
-    n_loc            = n_loc,
-    n_pos            = n_pos,
-    p                = p,
-    y                = y_prev,
-    C_pos            = intensity_data,
-    C_pos_int        = as.integer(intensity_data),
-    pos_idx          = pos_idx,
-    ID_coords        = ID_coords,
-    D_mat            = as.matrix(dist(coords)),
-    eta_fixed        = as.numeric(D %*% par$beta),
-    mda_impact       = mda_impact,
-    k                = par$k,
-    rho              = par$rho,
-    sigma2           = par$sigma2,
-    phi              = par$phi,
-    intensity_family = as.integer(intensity_family)
-  )
-
-  mod     <- get_stan_model(model = "sth", backend = backend, messages = messages)
-  backend <- mod$backend
-
-  if (messages)
-    message(sprintf("Sampling %d iter (%d warmup), %d chain(s) [sth, family=%s]...",
-                    n_samples + n_warmup, n_warmup, n_chains,
-                    ifelse(intensity_family == 0L, "shifted Gamma", "shifted NegBin2")))
-
-  fit       <- .run_stan(mod$model, backend, stan_data,
-                         n_samples, n_warmup, n_chains, n_cores,
-                         adapt_delta, max_treedepth, messages)
-  S_samples <- .extract_S(fit, backend, messages)
-
-  result <- list(S_samples = S_samples, stan_fit = fit,
-                 n_samples = nrow(S_samples), n_loc = n_loc,
-                 coords = coords, par = par, backend = backend)
-  class(result) <- "dsgm_spatial_samples"
-  result
-}
-
-
 ##' @title Sample spatial process for the LF multi-diagnostic model
 ##' @keywords internal
 sample_spatial_process_stan_lf <- function(y_counts,
@@ -357,10 +285,13 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
                                penalty, fix_alpha_W, fix_gamma_W,
                                vary_k = FALSE, omega1_start = 0.5,
                                intensity_family = 0L,
+                               std_factor = NULL, cov_offset = NULL,
                                start_pars, messages) {
 
   n <- length(y_prev)
   p <- ncol(D)
+  if (is.null(std_factor)) std_factor <- rep(1, n)
+  if (is.null(cov_offset)) cov_offset <- rep(0, n)
 
   .pen <- function(alpha_W, gamma_W, rho) {
     pen <- 0
@@ -435,7 +366,7 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
     # the MDA effect, so log_k and omega1 lie on a ridge and both diverge.
     omega1  <- if (vary_k) o1_0 else 0.0
 
-    mu_star <- exp(D %*% beta) *
+    mu_star <- as.numeric(exp(D %*% beta + cov_offset)) *
       compute_mda_effect(st_u, mda_times, im_u,
                          alpha_W, gamma_W, kappa = 1)[mda_map]
 
@@ -446,19 +377,20 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
       rep(k, n)
     }
 
-    c_rho <- 1 - exp(-rho)
+    rho_v <- rho / std_factor            # detection rate per worm in the sample
+    c_rho <- 1 - exp(-rho_v)
     pr <- pmax(pmin(1 - (k_vec / (k_vec + mu_star * c_rho))^k_vec, 1 - 1e-10), 1e-10)
 
     ll <- sum(log(1 - pr[y_prev == 0])) + sum(log(pr[y_prev == 1]))
 
     pos    <- which(y_prev == 1)
-    mu_pos <- mu_star[pos]; k_pos <- k_vec[pos]
+    mu_pos <- mu_star[pos]; k_pos <- k_vec[pos]; rv_pos <- rho_v[pos]
     # intensity terms mirror src/dsgm_tmb.cpp exactly (same clamps)
-    pr_pos <- pmax(1 - (k_pos / (k_pos + mu_pos * c_rho))^k_pos, 1e-10)
+    pr_pos <- pmax(1 - (k_pos / (k_pos + mu_pos * c_rho[pos]))^k_pos, 1e-10)
 
-    mu_C  <- rho * mu_pos / pr_pos
-    s2_C  <- pmax((rho * mu_pos * (1 + rho)) / pr_pos +
-                    (rho^2 * mu_pos^2 / pr_pos) * (1 / k_pos + 1 - 1 / pr_pos), 1e-6)
+    mu_C  <- rv_pos * mu_pos / pr_pos
+    s2_C  <- pmax((rv_pos * mu_pos * (1 + rv_pos)) / pr_pos +
+                    (rv_pos^2 * mu_pos^2 / pr_pos) * (1 / k_pos + 1 - 1 / pr_pos), 1e-6)
     mu_C1 <- pmax(mu_C - 1, 0.1)
 
     if (intensity_family == 0L) {
@@ -486,13 +418,16 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
   vc1 <- var(intensity_data - 1,  na.rm = TRUE)
   k0   <- if (!is.null(start_pars$k)) start_pars$k else
     if (!is.na(vc1) && vc1 > 0 && mc1 > 0) max(mc1^2 / vc1, 0.1) else 0.5
-  rho0 <- if (!is.null(start_pars$rho))     start_pars$rho     else 1
+  # rho is on the standardised scale (e.g. EPG per worm), so start it where
+  # the detection rate per worm in the sample, rho / v, equals one
+  rho0 <- if (!is.null(start_pars$rho))     start_pars$rho     else stats::median(std_factor)
   aW0  <- if (!is.null(start_pars$alpha_W)) start_pars$alpha_W else 0.5
   gW0  <- if (!is.null(start_pars$gamma_W)) start_pars$gamma_W else 2.0
   o1_0 <- if (!is.null(start_pars$omega1))  start_pars$omega1  else omega1_start
   b0   <- if (!is.null(start_pars$beta)) start_pars$beta else {
     b <- rep(0, p)
-    b[1] <- log(max(mean(y_prev) * mean(intensity_data, na.rm = TRUE), 1)); b }
+    b[1] <- log(max(mean(y_prev) * mean(intensity_data, na.rm = TRUE), 1)) -
+      mean(cov_offset); b }
 
   par0 <- c(b0, log(k0), log(rho0))
   if (is.null(fix_alpha_W)) par0 <- c(par0, qlogis(aW0))
@@ -500,8 +435,9 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
 
   # Box constraints keep weakly identified directions (alpha_W -> 0 makes
   # gamma_W free) at plausible values instead of drifting to +/- infinity.
-  lo <- c(rep(-Inf, p), log(1e-3), log(1e-3))
-  up <- c(rep( Inf, p), log(1e3),  log(1e2))
+  # rho bounds scale with v, so the bound on rho / v is unchanged
+  lo <- c(rep(-Inf, p), log(1e-3), log(1e-3 * min(std_factor)))
+  up <- c(rep( Inf, p), log(1e3),  log(1e2  * max(std_factor)))
   if (is.null(fix_alpha_W)) { lo <- c(lo, qlogis(0.01)); up <- c(up, qlogis(0.99)) }
   if (is.null(fix_gamma_W)) { lo <- c(lo, log(0.1));     up <- c(up, log(50)) }
   par0 <- pmin(pmax(par0, lo + 1e-8), up - 1e-8)
@@ -557,6 +493,14 @@ dsgm_initial_value <- function(y_prev, intensity_data, D, coords, ID_coords,
 ##'   Default is 0.5, consistent with estimates from Kenya hookworm survey data.
 ##' @param intensity_family Distribution for C | C > 0 (STH model only).
 ##'   \code{"gamma"} (default) = shifted Gamma; \code{"negbin"} = shifted NegBin2 (C - 1 ~ NB2).
+##' @param std_factor Optional name of a column in \code{data} (STH model only)
+##'   holding a known, strictly positive standardisation factor \eqn{v_{ij}}
+##'   that converts the raw count in the response into a standard unit, e.g.
+##'   \eqn{v = 1000/(41.7 k)} for \eqn{k} Kato-Katz smears (24 for one smear,
+##'   about 12 for two). When supplied, the response must be the RAW count and
+##'   \eqn{Y \mid W \sim \mathrm{Poisson}((\rho / v) W)}, so that \eqn{\rho}
+##'   is the mean EPG per worm. The factor acts on egg detection, not on the
+##'   mean worm burden. \code{NULL} (default) sets \eqn{v = 1}.
 ##' @param worm_family Distribution for the latent worm burden (LF model only).
 ##'   \code{"negbin"} (default) = Negative Binomial, with aggregation parameter
 ##'   \eqn{\omega} estimated (or fixed via \code{fix_k}). \code{"poisson"} = the
@@ -574,6 +518,7 @@ dsgm <- function(formula,
                  mda_times        = NULL,
                  int_mat          = NULL,
                  den              = NULL,
+                 std_factor       = NULL,
                  gamma_sens       = 0.97,
                  fix_k            = NULL,
                  use_mda          = NULL,
@@ -667,6 +612,19 @@ dsgm <- function(formula,
     if (any(is.na(den_vals)))            stop("Missing values detected in 'den' column")
   }
 
+  std_name <- deparse(substitute(std_factor))
+  if (std_name == "NULL") {
+    std_vals <- rep(1, n)
+  } else {
+    if (model != "sth")
+      stop("'std_factor' is only supported for model = 'sth'")
+    if (!std_name %in% names(data))
+      stop(sprintf("'std_factor' column '%s' not found in 'data'", std_name))
+    std_vals <- as.numeric(data[[std_name]])
+    if (any(is.na(std_vals)))                      stop("Missing values in 'std_factor' column")
+    if (any(!is.finite(std_vals) | std_vals <= 0)) stop("'std_factor' values must be finite and > 0")
+  }
+
   if (inherits(data, "sf")) {
     if (!is.null(convert_to_crs)) {
       data <- sf::st_transform(data, convert_to_crs); crs <- convert_to_crs
@@ -717,6 +675,9 @@ dsgm <- function(formula,
     egg_counts <- as.numeric(model.response(mf))
     if (any(egg_counts < 0, na.rm = TRUE)) stop("Egg counts cannot be negative")
     if (any(is.na(egg_counts)))            stop("Missing values in egg count response")
+    if (std_name != "NULL" && any(abs(egg_counts - round(egg_counts)) > 1e-8))
+      stop("With 'std_factor' supplied the response must be the raw egg count ",
+           "(integer), e.g. EPG / std_factor")
 
     y_prev         <- as.integer(egg_counts > 0)
     intensity_data <- egg_counts[egg_counts > 0]
@@ -727,6 +688,9 @@ dsgm <- function(formula,
       msg <- sprintf("STH data: %d observations, %d (%.1f%%) egg-positive [intensity: %s]",
                      n, n_pos, 100 * n_pos / n, intensity_family)
       if (vary_k) msg <- paste0(msg, "  [omega ~ mu_W]")
+      if (std_name != "NULL")
+        msg <- paste0(msg, sprintf("  [std_factor: %s, range %g-%g]", std_name,
+                                   min(std_vals), max(std_vals)))
       message(msg)
     }
 
@@ -750,6 +714,8 @@ dsgm <- function(formula,
         vary_k            = vary_k,
         omega1_start      = omega1_start,
         intensity_family  = intensity_family_int,
+        std_factor        = std_vals,
+        cov_offset        = cov_offset,
         start_pars        = start_pars,
         messages          = messages)
     }
@@ -783,6 +749,8 @@ dsgm <- function(formula,
       adapt_delta       = adapt_delta,
       max_treedepth     = max_treedepth,
       intensity_family  = intensity_family_int,
+      std_factor        = std_vals,
+      cov_offset        = cov_offset,
       backend           = backend,
       messages          = messages)
 
@@ -811,6 +779,7 @@ dsgm <- function(formula,
       penalty           = penalty,
       S_samples_obj     = sp,
       intensity_family  = intensity_family_int,
+      std_factor        = std_vals,
       vary_k            = vary_k,
       omega1_start      = if (!is.null(par0$omega1)) par0$omega1 else omega1_start,
       use_hessian_refinement = TRUE,
@@ -823,6 +792,8 @@ dsgm <- function(formula,
       prevalence_data   = y_prev,
       intensity_data    = intensity_data,
       egg_counts        = egg_counts,
+      std_factor        = std_vals,
+      std_name          = if (std_name == "NULL") NULL else std_name,
       n_positive        = n_pos,
       D                 = D,
       coords            = coords_u,
@@ -1020,6 +991,8 @@ dsgm <- function(formula,
 ##'   exp(log_k + omega1 * log(mu_W[i])). Must match the vary_k setting used
 ##'   in dsgm_fit_tmb().
 ##' @param intensity_family Integer; 0 = shifted Gamma (default), 1 = shifted NegBin2 (C - 1 ~ NB2).
+##' @param std_factor Numeric vector of known standardisation factors (length n); NULL = 1.
+##' @param cov_offset Numeric offset on log(mu_W) (length n); NULL = 0.
 ##' @keywords internal
 sample_spatial_process_stan <- function(y_prev,
                                         intensity_data,
@@ -1038,10 +1011,14 @@ sample_spatial_process_stan <- function(y_prev,
                                         max_treedepth    = 10,
                                         intensity_family = 0L,
                                         vary_k           = FALSE,
+                                        std_factor       = NULL,
+                                        cov_offset       = NULL,
                                         backend          = NULL,
                                         messages         = TRUE) {
 
   n       <- length(y_prev)
+  if (is.null(std_factor)) std_factor <- rep(1, n)
+  if (is.null(cov_offset)) cov_offset <- rep(0, n)
   n_loc   <- nrow(coords)
   p       <- ncol(D)
   pos_idx <- which(y_prev == 1)
@@ -1067,8 +1044,9 @@ sample_spatial_process_stan <- function(y_prev,
     pos_idx          = pos_idx,
     ID_coords        = ID_coords,
     D_mat            = as.matrix(dist(coords)),
-    eta_fixed        = as.numeric(D %*% par$beta),
+    eta_fixed        = as.numeric(D %*% par$beta + cov_offset),  # matches TMB
     mda_impact       = mda_impact,
+    std_factor       = as.numeric(std_factor),
     log_k            = log_k_val,    # replaces scalar k
     omega1           = omega1_val,   # = 0 when vary_k = FALSE
     rho              = par$rho,

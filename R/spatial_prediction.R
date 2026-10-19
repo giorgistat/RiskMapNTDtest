@@ -316,6 +316,8 @@ pred_over_grid <- function(object,
           n_chains          = n_chains_stan,
           n_cores           = n_cores_stan,
           intensity_family  = if (identical(object$intensity_family, "negbin")) 1L else 0L,
+          std_factor        = object$std_factor,
+          cov_offset        = object$cov_offset,
           messages          = messages
         )
 
@@ -544,6 +546,8 @@ pred_over_grid <- function(object,
   # Forward gamma_sens for lf_mdiag so pred_target_grid can read it
   if (is_dsgm && !is.null(object$gamma_sens))
     out$gamma_sens <- object$gamma_sens
+  if (is_dsgm && !is.null(object$worm_family))
+    out$worm_family <- object$worm_family
   out$par_hat  <- par_hat
   out$cov_offset <- pred_cov_offset
   out$type     <- type
@@ -559,10 +563,12 @@ pred_over_grid <- function(object,
 ##' For \strong{STH models} (\code{family = "intprev"}) the default predictive
 ##' targets are:
 ##' \describe{
-##'   \item{\code{prevalence}}{Probability of observing at least one egg,
-##'     \eqn{P(Y>0) = 1 - [k/(k + \mu_W(1-e^{-\rho}))]^k}.}
+##'   \item{\code{prevalence}}{Probability of observing at least one egg under
+##'     a reference protocol with standardisation factor \code{v_ref},
+##'     \eqn{P(Y>0) = 1 - [k/(k + \mu_W(1-e^{-\rho/v_{ref}}))]^k}.}
 ##'   \item{\code{worm_burden}}{Expected mean worm burden \eqn{\mu_W = e^{\eta}}.}
-##'   \item{\code{intensity}}{Mean egg count \eqn{\rho\,\mu_W} (unconditional).}
+##'   \item{\code{intensity}}{Mean standardised egg count (e.g. EPG)
+##'     \eqn{\rho\,\mu_W} (unconditional).}
 ##' }
 ##'
 ##' For \strong{LF models} (\code{family = "lf_mdiag"}) the default predictive
@@ -600,6 +606,10 @@ pred_over_grid <- function(object,
 ##'   predictor samples. Each function receives a matrix
 ##'   (\code{n_pred x n_samples}) and returns a matrix of the same dimensions.
 ##'   Overrides the model-specific defaults described above.
+##' @param v_ref Standardisation factor of the reference protocol at which STH
+##'   prevalence is predicted (e.g. 12 for duplicate Kato-Katz when the model
+##'   was fitted with \code{std_factor}). Default 1, which reproduces fits
+##'   without \code{std_factor}.
 ##' @param pd_summary Optional named list of summary functions applied
 ##'   row-wise to each target matrix (default: mean, median, sd, 2.5\% and
 ##'   97.5\% quantiles).
@@ -619,7 +629,8 @@ pred_target_grid <- function(object,
                              time_pred           = NULL,
                              include_re          = FALSE,
                              f_target            = NULL,
-                             pd_summary          = NULL) {
+                             pd_summary          = NULL,
+                             v_ref               = 1) {
 
   if (!inherits(object, "RiskMapNTDtest.pred.re"))
     stop("'object' must be an output of pred_over_grid()")
@@ -686,7 +697,10 @@ pred_target_grid <- function(object,
     if (sth_model) {
       k_val       <- object$par_hat$k
       rho_val     <- object$par_hat$rho
-      c_rho       <- 1 - exp(-rho_val)
+      # Prevalence refers to a reference protocol with standardisation factor
+      # v_ref (e.g. 12 for duplicate Kato-Katz when the model was fitted with
+      # std_factor); v_ref = 1 reproduces fits without std_factor.
+      c_rho       <- 1 - exp(-rho_val / v_ref)
       log_k_val   <- log(k_val)
       vary_k_flag <- isTRUE(object$vary_k) && !is.null(object$par_hat$omega1)
       omega1_val  <- if (vary_k_flag) object$par_hat$omega1 else 0.0
@@ -697,6 +711,25 @@ pred_target_grid <- function(object,
         else
           array(k_val, dim = dim(mu_W))
       }
+
+      f_target <- list(
+        prevalence = function(lp) {
+          mu_W <- exp(lp)
+          k_W  <- k_fun(mu_W)
+          1 - (k_W / (k_W + mu_W * c_rho))^k_W
+        },
+        intensity   = function(lp) rho_val * exp(lp),   # standardised scale (e.g. EPG)
+        worm_burden = function(lp) exp(lp)
+      )
+      if (vary_k_flag) {
+        f_target$aggregation <- function(lp) k_fun(exp(lp))
+      }
+
+    } else if (lf_model) {
+      k   <- object$par_hat$k
+      rho <- object$par_hat$rho
+      gs  <- if (!is.null(object$gamma_sens)) object$gamma_sens else 0.97
+      pois <- identical(object$worm_family, "poisson") || !is.finite(k)
 
       f_target <- list(
         mf_prevalence = function(lp) {
@@ -711,13 +744,6 @@ pred_target_grid <- function(object,
         },
         worm_burden = function(lp) exp(lp)
       )
-
-
-      if (vary_k_flag) {
-        f_target$aggregation <- function(lp) {
-          k_fun(exp(lp))
-        }
-      }
     }
   }
 
@@ -2007,6 +2033,7 @@ assess_pp <- function(object,
               formula       = .(fit0$formula),
               data          = data_sf[in_id, ],
               den           = .(as.name(den_name)),
+              std_factor    = .(if (is.null(fit0$std_name)) NULL else as.name(fit0$std_name)),
               time          = .(time_sym),
               intensity_family = .(fit0$intensity_family),
               worm_family   = .(fit0$worm_family %||% "negbin"),
@@ -2054,6 +2081,8 @@ assess_pp <- function(object,
             refit_i$prevalence_data <- refit_i$prevalence_data[keep]
             refit_i$egg_counts <- refit_i$egg_counts[keep]
             refit_i$intensity_data <- refit_i$egg_counts[refit_i$egg_counts>0]
+            if (!is.null(refit_i$std_factor))
+              refit_i$std_factor <- refit_i$std_factor[keep]
           } else if(lf_flag) {
             refit_i$y_counts <- refit_i$y_counts[keep]
             refit_i$which_diag <- refit_i$which_diag[keep]
@@ -2132,6 +2161,11 @@ assess_pp <- function(object,
           ## STH: hurdle process -- Bernoulli gate + intensity | positive
           omega1_i <- coef(refit_i)$omega1
           agg_W <- if (isTRUE(refit_i$vary_k)) k_i * mu_W^omega1_i else k_i
+
+          ## detection rate per worm at each held-out row: rho / v. The vector
+          ## has one entry per row of mu_W, so it recycles down the columns.
+          v_out <- if (is.null(fit0$std_factor)) 1 else fit0$std_factor[out_id]
+          rho_i <- rho_i / v_out
 
           prev_samples <- 1 - (agg_W / (agg_W + mu_W * (1 - exp(-rho_i))))^agg_W
 

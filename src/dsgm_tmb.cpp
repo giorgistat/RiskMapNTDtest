@@ -17,7 +17,13 @@
 //
 //   omega1 is a free, unpenalised regression slope — well-identified from data.
 //
-//   Y_ij | W_j(x_i) ~ Poisson(rho * W_j(x_i))
+//   Y_ij | W_j(x_i) ~ Poisson((rho / v_ij) * W_j(x_i))
+//
+//   Y_ij is the RAW egg count and v_ij a known standardisation factor (e.g.
+//   24 for one Kato-Katz smear, 12 for two), so that rho is the mean number
+//   of eggs per gram (EPG) per worm and rho / v_ij the mean number of eggs
+//   detected per worm in the sample examined. v_ij = 1 recovers the original
+//   model. The factor acts on detection only, not on mu_W.
 //
 // Intensity likelihood for C | C > 0 (controlled by intensity_family):
 //   0 = Shifted Gamma:           C - 1 ~ Gamma(kappa_C, theta_C)
@@ -35,8 +41,8 @@
 //     S_s' R^{-1} S_s via one atomic::matmul, as in inst/tmb/dsgm_mdiag.cpp.
 //     The previous AD Cholesky plus per-sample triangular solves cost
 //     O(n_loc^3 + n_samples * n_loc^2) taped operations.
-//   * Observations are collapsed into groups that share mu_W (same location,
-//     survey time, covariates, offset and MDA history; see
+//   * Observations are collapsed into groups that share mu_W and v (same
+//     location, survey time, covariates, offset, std factor and MDA history; see
 //     R/sth_obs_groups.R). Prevalence and intensity terms are summed exactly
 //     per group, so the Monte Carlo loop costs O(G + n_pos) per sample instead
 //     of O(n). Only the NegBin term lgamma(c + phi_C) remains per positive,
@@ -64,6 +70,7 @@ Type objective_function<Type>::operator() ()
 
   DATA_MATRIX(D);
   DATA_VECTOR(cov_offset);
+  DATA_VECTOR(std_factor);     // known standardisation factor v_ij (> 0), length n
 
   DATA_MATRIX(S_samples);
   DATA_IVECTOR(ID_coords);
@@ -201,16 +208,19 @@ Type objective_function<Type>::operator() ()
   // ===========================================================================
 
   vector<Type> mu_fixed = D * beta + cov_offset;
-  const Type   c_rho    = Type(1.0) - exp(-rho);
 
   vector<Type> eta_g(G);   // fixed-effects predictor, per group
   vector<Type> mda_g(G);   // MDA effect, per group
+  vector<Type> rho_g(G);   // detection rate per worm in the sample, rho / v
+  vector<Type> crho_g(G);  // 1 - exp(-rho / v)
   vector<int>  loc_g(G);
   for (int g = 0; g < G; g++) {
-    int i    = grp_rep(g);
-    eta_g(g) = mu_fixed(i);
-    mda_g(g) = mda_effect(i);
-    loc_g(g) = ID_coords(i);
+    int i     = grp_rep(g);
+    eta_g(g)  = mu_fixed(i);
+    mda_g(g)  = mda_effect(i);
+    rho_g(g)  = rho / std_factor(i);
+    crho_g(g) = Type(1.0) - exp(-rho_g(g));
+    loc_g(g)  = ID_coords(i);
   }
 
   // ===========================================================================
@@ -231,7 +241,7 @@ Type objective_function<Type>::operator() ()
       Type k_i  = (vary_k == 1) ?
         exp(log_k + omega1 * log(mu_W + Type(1e-10))) : k;
 
-      Type ratio = k_i / (k_i + mu_W * c_rho);
+      Type ratio = k_i / (k_i + mu_W * crho_g(g));
       Type pr_r  = Type(1.0) - pow(ratio, k_i);
       mu_g(g) = mu_W; k_g(g) = k_i; praw_g(g) = pr_r;
 
@@ -248,10 +258,11 @@ Type objective_function<Type>::operator() ()
       Type mu_i = mu_g(g);
       Type k_i  = k_g(g);
       Type pr_i = CppAD::CondExpLt(praw_g(g), Type(1e-10), Type(1e-10), praw_g(g));
+      Type rv   = rho_g(g);
 
-      Type mu_C     = (rho * mu_i) / pr_i;
-      Type sigma2_C = (rho * mu_i * (Type(1.0) + rho)) / pr_i
-        + (rho * rho * mu_i * mu_i / pr_i)
+      Type mu_C     = (rv * mu_i) / pr_i;
+      Type sigma2_C = (rv * mu_i * (Type(1.0) + rv)) / pr_i
+        + (rv * rv * mu_i * mu_i / pr_i)
         * (Type(1.0)/k_i + Type(1.0) - Type(1.0)/pr_i);
       sigma2_C = CppAD::CondExpLt(sigma2_C, Type(1e-6), Type(1e-6), sigma2_C);
 

@@ -15,7 +15,9 @@
 //     vary_k = 0:  omega_i = exp(log_k)                          [constant]
 //     vary_k = 1:  log(omega_i) = log_k + omega1 * log(mu_W[i]) [varies with burden]
 //
-//   Y_ij | W_j(x_i) ~ Poisson(rho * W_j(x_i))
+//   Y_ij | W_j(x_i) ~ Poisson((rho / v[i]) * W_j(x_i))
+//   Y_ij is the raw egg count and v[i] a known standardisation factor
+//   (v = 1 recovers the original model; rho is then per sample).
 //
 // Intensity likelihood for C | C > 0 (controlled by intensity_family):
 //   0 = Shifted Gamma:           C - 1 ~ Gamma(kappa_C, rate_C)
@@ -59,12 +61,15 @@ data {
   // Pre-computed MDA decay factor per observation (1.0 = no MDA)
   vector<lower=0>[n] mda_impact;
 
+  // Known standardisation factor per observation (1.0 = none)
+  vector<lower=0>[n] std_factor;
+
   // Fixed parameters at theta_0
   // log_k  = log of the baseline aggregation parameter (= log(k) when vary_k=0)
   // omega1 = slope of log(omega) on log(mu_W); set to 0.0 when vary_k=0
   real log_k;
   real omega1;
-  real<lower=0> rho;     // Per-worm egg detection rate
+  real<lower=0> rho;     // Eggs per standardised unit (e.g. EPG) per worm
   real<lower=0> sigma2;  // GP variance
   real<lower=0> phi;     // GP range
 
@@ -82,7 +87,12 @@ transformed data {
 
   matrix[n_loc, n_loc] R;
   matrix[n_loc, n_loc] L;
-  real c_rho = 1.0 - exp(-rho);
+  vector[n] rho_v;       // detection rate per worm in the sample, rho / v
+  vector[n] c_rho;       // 1 - exp(-rho / v)
+  for (i in 1:n) {
+    rho_v[i] = rho / std_factor[i];
+    c_rho[i] = 1.0 - exp(-rho_v[i]);
+  }
 
   for (i in 1:n_loc) {
     R[i, i] = 1.0;
@@ -120,7 +130,7 @@ transformed parameters {
       k_vec[i] = exp(log_k);
     }
 
-    real ratio = k_vec[i] / (k_vec[i] + mu_W[i] * c_rho);
+    real ratio = k_vec[i] / (k_vec[i] + mu_W[i] * c_rho[i]);
     pr_pos[i]  = fmax(fmin(1.0 - pow(ratio, k_vec[i]), 1.0 - 1e-10), 1e-10);
   }
 
@@ -143,12 +153,13 @@ model {
   for (idx in 1:n_pos) {
     int  i   = pos_idx[idx];
     real k_i = k_vec[i];
+    real rv  = rho_v[i];
 
     // Conditional moments of C | C > 0
-    real mu_C     = (rho * mu_W[i]) / pr_pos[i];
+    real mu_C     = (rv * mu_W[i]) / pr_pos[i];
     real sigma2_C = fmax(
-      (rho * mu_W[i] * (1.0 + rho)) / pr_pos[i]
-      + (rho^2 * mu_W[i]^2 / pr_pos[i]) * (1.0/k_i + 1.0 - 1.0/pr_pos[i]),
+      (rv * mu_W[i] * (1.0 + rv)) / pr_pos[i]
+      + (rv^2 * mu_W[i]^2 / pr_pos[i]) * (1.0/k_i + 1.0 - 1.0/pr_pos[i]),
       1e-6);
 
     if (intensity_family == 0) {
