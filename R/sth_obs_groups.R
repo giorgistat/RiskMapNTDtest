@@ -1,7 +1,7 @@
 ##' Collapse STH observations into groups sharing the same worm-burden mean
 ##'
-##' Individuals with the same location, survey time, covariate row, offset and
-##' MDA history have identical \eqn{\mu_W}, aggregation and prevalence
+##' Individuals with the same location, survey time, covariate row, offset,
+##' standardisation factor and MDA history have identical \eqn{\mu_W}, aggregation and prevalence
 ##' probability for every Monte Carlo sample of \eqn{S}. Their likelihood
 ##' contributions can therefore be summed exactly at group level, which shrinks
 ##' the TMB tape of the MCML objective from O(n * n_samples) to roughly
@@ -13,10 +13,12 @@
 ##' @return A list of data items consumed by \code{src/dsgm_tmb.cpp}.
 ##' @keywords internal
 .sth_obs_groups <- function(y_prev, intensity_data, D, cov_offset, ID_coords,
-                            survey_times, int_mat) {
+                            survey_times, int_mat, std_factor = NULL) {
 
+  if (is.null(std_factor)) std_factor <- rep(1, length(y_prev))
   hx  <- function(x) sprintf("%a", as.numeric(x))
-  key <- do.call(paste, c(list(ID_coords, hx(survey_times), hx(cov_offset)),
+  key <- do.call(paste, c(list(ID_coords, hx(survey_times), hx(cov_offset),
+                               hx(std_factor)),
                           lapply(seq_len(ncol(D)),       function(j) hx(D[, j])),
                           lapply(seq_len(ncol(int_mat)), function(j) hx(int_mat[, j])),
                           sep = "|"))

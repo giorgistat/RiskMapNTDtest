@@ -178,6 +178,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
                          fix_tau2          = NULL,
                          use_mda           = TRUE,
                          intensity_family  = 0L,
+                         std_factor        = NULL,
                          vary_k            = FALSE,
                          omega1_start      = 0.5,
                          use_hessian_refinement = TRUE,
@@ -218,6 +219,8 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
   n_loc     <- nrow(coords)
   S_samples <- S_samples_obj$S_samples
   pos_idx   <- which(y_prev == 1) - 1L
+  if (is.null(std_factor)) std_factor <- rep(1, n)
+  if (length(std_factor) != n) stop("'std_factor' must have length n")
 
   vary_k_int <- as.integer(vary_k)
 
@@ -258,7 +261,8 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
                               cov_offset     = cov_offset,
                               ID_coords      = ID_coords - 1L,
                               survey_times   = survey_times_data,
-                              int_mat        = int_mat)
+                              int_mat        = int_mat,
+                              std_factor     = std_factor)
   if (messages)
     message(sprintf("  Observation groups: %d observations -> %d groups (%d with positives)",
                     n, grp_data$n_groups, length(grp_data$pgrp)))
@@ -271,6 +275,7 @@ dsgm_fit_tmb <- function(y_prev            = NULL,
       pos_idx                  = pos_idx,
       D                        = D,
       cov_offset               = cov_offset,
+      std_factor               = as.numeric(std_factor),
       S_samples                = S_samples,
       ID_coords                = ID_coords - 1L,
       dist_vec                 = dist_vec,
